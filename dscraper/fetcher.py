@@ -1,13 +1,15 @@
 __all__ = ('Fetcher', )
 
 import asyncio
-import zlib
 import re
+import zlib
+import xmltodict as x2d
+import json
 
-from . import utils
-from .exceptions import ConnectionError, ConnectTimeout, NoResponseError, DecodeError
+from .utils import get_logger, alock
+from .exceptions import ConnectionError, ConnectTimeout, ResponseError, DecodeError, ParseError
 
-_logger = utils.get_logger(__name__)
+_logger = get_logger(__name__)
 
 _HOST = 'comment.bilibili.com'
 _PORT = 80
@@ -26,7 +28,7 @@ _BACKUP_HEADERS = {
 }
 _CONNECT_TIMEOUT = 7
 _READ_TIMEOUT = 14
-_RETRIES = 3
+_RETRIES = 2
 
 class Fetcher:
 
@@ -35,11 +37,18 @@ class Fetcher:
         self.loop = loop
         self.headers = _DEFAULT_HEADERS
         self.template = _REQUEST_TEMPLATE.format(headers=
-            ''.join('{}:{}\r\n'.format(k, v) for k, v in self.headers.items()))
-        self.decompressor = zlib.decompressobj(-zlib.MAX_WBITS)
+                            _get_headers_text(self.headers))
+
+    async def __aenter__(self):
+        await self.connect()
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb):
+        self.disconnect()
 
     async def connect(self):
         self.disconnect()
+        # if connection timed out, retry
         for tries in range(1, _RETRIES + 1):
             try:
                 self.reader, self.writer = await asyncio.wait_for(
@@ -53,31 +62,109 @@ class Fetcher:
         _logger.warning('Failed to connect to the host after %d tries', _RETRIES)
         raise ConnectTimeout('connection to the host timed out')
 
-    async def fetch(self, uri):
-        # raise ConnectionError (& ConnectTimeout), DecodeError
-        # send the request and read the raw response body
+    @alock
+    @asyncio.coroutine
+    def fetch(self, uri):
+        """raise ConnectionError(, ConnectTimeout), DecodeError"""
         request = self.template.format(uri=uri).encode('ascii')
-        for tries in range(1, _RETRIES + 1):
-            self.writer.write(request)
+
+        # if ConnectionError occurred, retry
+        retries = 0
+        while True:
+
             try:
-                await self.writer.drain()
-                raw = await self._read()
-            except ConnectionResetError:
-                _logger.info('Connection to %s was reset', uri)
-            except NoResponseError:
-                _logger.info('No response was recieved from %s', uri)
-            else:
-                # produce output
-                if not raw:
-                    return None
+                # send the request
+                self.writer.write(request)
                 try:
-                    return self.decompressor.decompress(raw).decode()
-                except (zlib.error, UnicodeDecodeError) as e:
-                    _logger.warning('Failed to decode the raw content from %s for %s', uri, e)
-                    raise DecodeError('cannot decode the raw content')
-            await self.connect()
-        _logger.warning('Failed to read from %s after %d tries', uri, _RETRIES)
-        raise ConnectionError('cannot read from %s' % uri)
+                    yield from self.writer.drain()
+                except ConnectionResetError:
+                    _logger.info('Connection to %s was reset', uri)
+                    raise ConnectionError('connection reset')
+
+                # read the response
+                response = yield from self._read()
+
+                # disassemble the response
+                try:
+                    headers, body = response.split(b'\r\n\r\n', maxsplit=1)
+                except ValueError:
+                    _logger.info('Response from %s was invalid', uri)
+                    _logger.debug('response: \n%s', response)
+                    raise ResponseError('invalid response')
+
+            except ConnectionError as e:
+                # guarding condition
+                if retries >= _RETRIES:
+                    _logger.warning('Failed to read from %s after %d retries', uri, _RETRIES)
+                    raise ConnectionError('cannot read from {}'.forma(uri)) from e
+
+            else:
+                break
+
+            retries += 1
+            _logger.info('Trying to solve this problem by reconnecting to the host')
+            yield from self.connect()
+
+        # check the status code
+        match = re.search(b'HTTP/1.1 (\d+) ', headers)
+        if match and int(match.group(1)) == 404:
+            _logger.info('%s is a 404 page', uri)
+            return None
+
+        # inflate and decode the body
+        try:
+            inflated = zlib.decompressobj(-zlib.MAX_WBITS).decompress(body)
+            return inflated.decode()
+        except (zlib.error, UnicodeDecodeError) as e:
+            _logger.warning('Failed to decode the data from %s: %s', uri, e)
+            _logger.debug('cannot decode: \n%s', body)
+            raise DecodeError('cannot decode the response') from e
+
+    async def fetch_comments(self, cid, timestamp=0):
+        if timestamp == 0:
+            uri = '/{}.xml'.format(cid)
+        else:
+            uri = '/dmroll,{},{}'.format(timestamp, cid)
+        # expected outcome:
+        #   valid XML string, √
+        #   no outcome / 404 not found, √
+        #   XML string containing a single element with 'error' as content, or
+        #   XML string with invalid characters
+        # exception:
+        #   connection timed out
+        #   cannot decode
+        text = await self.fetch(uri)
+
+        if not text:
+            return None
+        try:
+            xml = x2d.parse(text)
+        except Exception as e: # TODO what exception means what?
+            _logger.warning('Failed to parse the content as XML at cid %s: %s', cid, e)
+            raise ParseError('content cannot be parsed as XML')
+        # TODO
+        # if :
+        #     pass
+        return xml
+
+    async def fetch_rolldate(self, cid):
+        uri = '/rolldate,{}'.format(cid)
+        # expected outcome:
+        #   valid JSON string, √
+        #   no outcome / 404 not found, √
+        # exception:
+        #   connection timed out
+        #   cannot decode
+        text = await self.fetch(uri)
+
+        if not text:
+            return None
+        try:
+            json = json.loads(text)
+        except json.JSONDecodeError as e:
+            _logger.warning('Failed to parse the content as JSON at cid %s: %s', cid, e)
+            raise ParseError('content cannot be parsed as JSON')
+        return json
 
     def disconnect(self):
         if self.connected:
@@ -85,45 +172,32 @@ class Fetcher:
             self.connected = False
 
     async def _read(self):
-        body = None
-
+        # _logger.debug('read start')
         # TODO no data from host time-out / read time-out
+        # shield, wait_for
         response = b''
-        while True:
-            chunk = await self.reader.read(1024)
+        while not _is_response_complete(response):
+            chunk = await self.reader.read(16384)
             if not chunk:
                 break
             response += chunk
+        # _logger.debug('read over')
+        return response
 
-            # determine the length of response by looking for Content-Length
-            parts = response.split(b'\r\n\r\n', maxsplit=1)
-            if len(parts) is not 2:
-                continue
-            headers, body = parts
-            match = re.search(b'Content-Length: (\d+)\r\n', headers)
-            # if Content-Length is found, read bytes of the same length only,
-            # which are supposed to be the body of response
+def _get_headers_text(headers):
+    return ''.join('{}:{}\r\n'.format(k, v) for k, v in headers.items())
+
+def _is_response_complete(raw):
+    """Locate the end of response by looking for Content-Length.
+    If Content-Length is found in the response, read bytes of the same length only,
+    which are supposed to be the body of response.
+    """
+    parts = raw.split(b'\r\n\r\n', maxsplit=1)
+    if len(parts) == 2:
+        headers, upperbody = parts
+        match = re.search(b'Content-Length: (\d+)\r\n', headers)
+        if match:
             content_length = int(match.group(1))
-            while len(body) < content_length:
-                chunk = await self.reader.read(16384)
-                if not chunk:
-                    break
-                body += chunk
-            break
-        if not response:
-            raise NoResponseError
-        if not body:
-            headers, body = response.split(b'\r\n\r\n', maxsplit=1)
+            return len(upperbody) == content_length
+    return False
 
-        if _get_status_code(headers) is 404:
-            _logger.info('%s is a 404 page', uri)
-            return None
-        return body
-
-
-
-def _get_status_code(raw):
-    match = re.search(b'HTTP/1.1 (\d+) ', raw)
-    if match:
-        return int(match.group(1))
-    return None
