@@ -1,47 +1,64 @@
 from random import shuffle
 
-_MAX_HEALTH = 121
-_HEALTH_REGEN = _MAX_HEALTH / 10
+_MAX_HEALTH = 120
 
 class DscraperError(Exception):
-	pass
+    damage = 0 # times workers can trigger exceptions before killing themselves
 
 class ConnectionError(DscraperError, OSError):
-	"""An error occured while trying to communicate with the host for multiple times.
+    """An error occured while trying to communicate with the host for multiple times.
 
-	Do not retry until the problem is fixed, which is probably that either
-	your IP is blocked by the host, or your Internet connection is lost.
-	"""
-	damage = 40
+    Do not retry until the problem is fixed, which is probably that either
+    your IP is blocked by the host, or your Internet connection is lost.
+    """
+    damage = 40
 
 class ConnectTimeout(ConnectionError):
     """All attempts to connect to the host timed out."""
 
-class NoResponseError(ConnectionError):
-	"""No response was given by the host."""
+class ResponseError(ConnectionError):
+    """The response from the host was invalid."""
 
 class DataError(DscraperError, ValueError):
-	"""The data read from the connection is invalid"""
-	damage = 15
+    """The data read from the response was invalid"""
+    damage = 30
 
 class DecodeError(DataError):
     """The byte array cannot be decoded."""
-	# TODO what is its damage?
+    # TODO what is its damage?
 
 class ParseError(DataError):
     """The string cannot be parsed as XML or JSON."""
 
 class InvalidCid(DscraperError, ValueError, TypeError):
-	"""The worker was fed with an invalid cid to work with"""
-	damage = 10
+    """The worker was fed with an invalid cid to work with."""
+    damage = 24
 
+class Life:
 
-def _mark_recorders(workers):
-	recorders = max(int(len(workers) / 3 + 0.5), 1)
-	for i, worker in enumerate(workers):
-	    worker.is_recorder = i < recorders
-	shuffle(workers)
+    def __init__(self):
+        self.health = self._max_health = _MAX_HEALTH
+        self.regen = _MAX_HEALTH / 10
+        self.are_recorders_set = False
 
-class _Health:
+    def set_recorders(self, workers):
+        num_workers = len(workers)
+        recorders = min(num_workers, 3)
+        for i, worker in enumerate(workers):
+            worker._recorder = i < recorders
+        shuffle(workers)
 
-    def __init__(self, workers):
+        self.health = self._max_health = _MAX_HEALTH * recorders
+        self.regen = _MAX_HEALTH / 10 * (recorders / num_workers)
+        self.are_recorders_set = True
+
+    def heal(self):
+        self.health = min(self.health + self.regen, self._max_health)
+
+    def damage(self, worker, e):
+        if (self.are_recorders_set and not work._recorder) or e.damage <= 0:
+            return
+        self.health -= e.damage
+
+    def is_dead(self):
+        return self.health <= 0
