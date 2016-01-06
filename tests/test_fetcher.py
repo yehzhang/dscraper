@@ -15,70 +15,6 @@ logging.getLogger("asyncio").setLevel(logging.WARNING)
 logging.basicConfig(stream=sys.stdout, level=logging.DEBUG)
 logger = logging.getLogger(__name__)
 
-class Test_Fetcher(unittest.TestCase):
-
-    def setUp(self):
-        self.maxDiff = None
-        self.mtime = self.rtime = None
-        self.loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(self.loop)
-        self.f = Fetcher(loop=self.loop)
-        self.loop.run_until_complete(self.f.connect())
-        self.targets = [
-            '/1.xml',
-            '/2.xml',
-            '/4.xml'
-        ]
-
-    def tearDown(self):
-        self.f.disconnect()
-        tasks = asyncio.Task.all_tasks(self.loop)
-        self.loop.close()
-        if self.mtime and self.rtime:
-            logger.debug('my time: %f, reference time: %f', self.mtime, self.rtime)
-
-    def compare(self, mfn, rfn, uri):
-        fut = asyncio.ensure_future(mfn(uri))
-        actual, mtime = timer(self.loop.run_until_complete, fut)
-
-        expected, rtime = timer(rfn, uri)
-
-        self.assertEqual(expected, actual, 'unexpected result')
-        return mtime, rtime
-
-    def compare_s(self, mfn, rfn, uris):
-        futs = (asyncio.ensure_future(mfn(uri)) for uri in uris)
-        actuals, mttime = timer(self.loop.run_until_complete, asyncio.gather(*futs))
-
-        rttime = 0
-        for i, uri in enumerate(uris):
-            expected, rtime = timer(rfn, uri)
-            self.assertEqual(expected, actuals[i], 'unexpected result')
-            rttime += rtime
-
-        return mttime, rttime
-
-    def test_fetch(self):
-        uri = self.targets[1]
-        self.compare(self.f.fetch, reference_fetch, uri)
-
-    def test_multiple_auto_blocking_fetch(self):
-        self.mtime, self.rtime = self.compare_s(self.f.fetch, reference_fetch, self.targets)
-
-    def test_multiple_manual_blocking_fetch(self):
-        mttime, rttime = 0, 0
-        for uri in self.targets:
-            mtime, rtime = self.compare(self.f.fetch, reference_fetch, uri)
-            mttime += mtime
-            rttime += rtime
-        self.mtime, self.rtime = mttime, rttime
-
-    def test_get_xml(self):
-        async def fetch_xml(uri):
-            cid = re.match('/(\d+)', uri).group(1)
-            return await self.f.fetch_comments(cid)
-
-        self.mtime, self.rtime = self.compare_s(fetch_xml, reference_fetch_xml, self.targets)
 
 def reference_fetch(uri):
     return requests.get('http://comment.bilibili.com' + uri).text
@@ -93,3 +29,71 @@ def timer(fn, *args, **kwargs):
     end = time.time()
     elapsed = round(end - start, 3)
     return result, elapsed
+
+
+class Test_Fetcher(unittest.TestCase):
+
+    targets = [
+        '/1.xml',
+        '/2.xml',
+        '/4.xml'
+    ]
+    expected = {uri: reference_fetch(uri) for uri in targets}
+
+    def setUp(self):
+        self.maxDiff = None
+        self.mtime = self.rtime = None
+        self.loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(self.loop)
+        self.f = Fetcher(loop=self.loop)
+        self.loop.run_until_complete(self.f.connect())
+
+    def tearDown(self):
+        self.f.disconnect()
+        self.loop.close()
+
+    def compare(self, mfn, uri, rfn=None):
+        fut = asyncio.ensure_future(mfn(uri))
+        actual, time = timer(self.loop.run_until_complete, fut)
+
+        if rfn is None:
+            expected = self.expected[uri]
+        else:
+            expected = rfn(uri)
+
+        self.assertEqual(expected, actual, 'unexpected result')
+        return time
+
+    def compare_s(self, mfn, uris, rfn=None):
+        futs = (asyncio.ensure_future(mfn(uri)) for uri in uris)
+        actuals, time = timer(self.loop.run_until_complete, asyncio.gather(*futs))
+
+        for i, uri in enumerate(uris):
+            if rfn is None:
+                expected = self.expected[uri]
+            else:
+                expected = rfn(uri)
+            self.assertEqual(expected, actuals[i], 'unexpected result')
+
+        return time
+
+    # @unittest.skip('duplicated field')
+    def test_fetch(self):
+        uri = self.targets[1]
+        self.compare(self.f.fetch, uri)
+
+    def test_multiple_auto_blocking_fetch(self):
+        self.compare_s(self.f.fetch, self.targets)
+
+    def test_multiple_manual_blocking_fetch(self):
+        for uri in self.targets:
+            self.compare(self.f.fetch, uri)
+
+    # @unittest.skip('duplicated field')
+    def test_get_xml(self):
+        async def fetch_xml(uri):
+            cid = re.match('/(\d+)', uri).group(1)
+            return await self.f.fetch_comments(cid)
+
+        self.compare_s(fetch_xml, self.targets, reference_fetch_xml)
+
