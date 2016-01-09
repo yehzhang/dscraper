@@ -10,6 +10,7 @@ import re
 from dscraper.fetcher import Fetcher
 from dscraper.exceptions import DataError
 
+
 logging.getLogger("requests").setLevel(logging.WARNING)
 logging.getLogger("asyncio").setLevel(logging.WARNING)
 logging.basicConfig(stream=sys.stdout, level=logging.DEBUG)
@@ -46,10 +47,10 @@ class Test_Fetcher(unittest.TestCase):
         self.loop = asyncio.new_event_loop()
         asyncio.set_event_loop(self.loop)
         self.f = Fetcher(loop=self.loop)
-        self.loop.run_until_complete(self.f.connect())
+        self.loop.run_until_complete(self.f.open())
 
     def tearDown(self):
-        self.f.disconnect()
+        self.f.close()
         self.loop.close()
 
     def compare(self, mfn, uri, rfn=None):
