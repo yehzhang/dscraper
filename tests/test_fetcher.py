@@ -7,8 +7,7 @@ import time
 import xmltodict as x2d
 import re
 
-from dscraper.fetcher import Fetcher
-from dscraper.exceptions import DataError
+import dscraper
 
 
 logging.getLogger("requests").setLevel(logging.WARNING)
@@ -35,66 +34,92 @@ def timer(fn, *args, **kwargs):
 class Test_Fetcher(unittest.TestCase):
 
     targets = [
+        '/0.xml',
         '/1.xml',
         '/2.xml',
-        '/4.xml'
+        '/3.xml',
+        '/4.xml',
+        '/5.xml',
+        '/6.xml',
+        '/7.xml',
+        '/8.xml',
+        '/9.xml'
     ]
-    expected = {uri: reference_fetch(uri) for uri in targets}
+    expected = {uri: reference_fetch(uri) for uri in targets[1:]}
+    expected[targets[0]] = None
+
+    @classmethod
+    def setUpClass(cls):
+        cls.loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(cls.loop)
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.loop.close()
 
     def setUp(self):
         self.maxDiff = None
-        self.mtime = self.rtime = None
-        self.loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(self.loop)
-        self.f = Fetcher(loop=self.loop)
+        self.f = dscraper.Fetcher(loop=self.loop)
         self.loop.run_until_complete(self.f.open())
 
     def tearDown(self):
         self.f.close()
-        self.loop.close()
 
-    def compare(self, mfn, uri, rfn=None):
-        fut = asyncio.ensure_future(mfn(uri))
-        actual, time = timer(self.loop.run_until_complete, fut)
+    def compare(self, actual, uri, reffn=None):
+        expected = self.expected[uri] if reffn is None else reffn(uri)
+        self.assertEqual(expected, actual, 'My result is not what is expected on {}'.format(uri))
 
-        if rfn is None:
-            expected = self.expected[uri]
-        else:
-            expected = rfn(uri)
+    def run_compare(self, myfn, uri, reffn=None):
+        fut = asyncio.ensure_future(myfn(uri))
+        actual = self.loop.run_until_complete(fut)
+        self.compare(actual, uri, reffn)
 
-        self.assertEqual(expected, actual, 'unexpected result')
-        return time
+    def run_compare_multiple(self, mycoro, uris, reffn=None):
+        fut = asyncio.ensure_future(mycoro(uris))
+        actuals = self.loop.run_until_complete(fut)
+        for uri, actual in zip(uris, actuals):
+            self.compare(actual, uri, reffn)
 
-    def compare_s(self, mfn, uris, rfn=None):
-        futs = (asyncio.ensure_future(mfn(uri)) for uri in uris)
-        actuals, time = timer(self.loop.run_until_complete, asyncio.gather(*futs))
+    def run_compare_all(self, myfn, uris, reffn=None):
+        futs = (asyncio.ensure_future(myfn(uri)) for uri in uris)
+        actuals = self.loop.run_until_complete(asyncio.gather(*futs))
+        for uri, actual in zip(uris, actuals):
+            self.compare(actual, uri, reffn)
 
-        for i, uri in enumerate(uris):
-            if rfn is None:
-                expected = self.expected[uri]
-            else:
-                expected = rfn(uri)
-            self.assertEqual(expected, actuals[i], 'unexpected result')
+    async def fetch_range(self, uris):
+        actuals = []
+        for uri in uris:
+            actuals.append(await self.f.fetch(uri))
+        return actuals
 
-        return time
-
-    # @unittest.skip('duplicated field')
+    # @unittest.skip('duplicated case')
     def test_fetch(self):
         uri = self.targets[1]
-        self.compare(self.f.fetch, uri)
+        self.run_compare(self.f.fetch, uri)
 
+    # @unittest.skip('duplicated case')
     def test_multiple_auto_blocking_fetch(self):
-        self.compare_s(self.f.fetch, self.targets)
+        self.run_compare_multiple(self.fetch_range, self.targets[1:])
 
+    # @unittest.skip('duplicated case')
     def test_multiple_manual_blocking_fetch(self):
-        for uri in self.targets:
-            self.compare(self.f.fetch, uri)
+        for i, uri in enumerate(self.targets[1:]):
+            self.run_compare(self.f.fetch, uri)
 
-    # @unittest.skip('duplicated field')
-    def test_get_xml(self):
-        async def fetch_xml(uri):
-            cid = re.match('/(\d+)', uri).group(1)
-            return await self.f.fetch_comments(cid)
+    # @unittest.skip('duplicated case')
+    def test_await_running_fetch_coroutine(self):
+        try:
+            self.run_compare_all(self.f.fetch, self.targets)
+        except RuntimeError:
+            logger.debug('RuntimeError raisen, correct')
+        else:
+            self.fail('RuntimeError should be raised on starting the already running fetch() coroutine')
 
-        self.compare_s(fetch_xml, self.targets, reference_fetch_xml)
+    # @unittest.skip('duplicated case')
+    def test_404(self):
+        uri = self.targets[0]
+        self.run_compare(self.f.fetch, uri)
 
+    # TODO
+    # def test_multipleerrors():
+    #     pass
