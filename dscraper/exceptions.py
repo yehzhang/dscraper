@@ -1,31 +1,55 @@
+__all__ = ('DscraperError', 'HostError', 'ConnectTimeout',
+           'ResponseError', 'DataError', 'DecodeError', 'ParseError',
+           'InvalidCid', 'MultipleErrors', 'NoResponseReadError')
+
+from traceback import format_exception
 from random import shuffle
 
 _MAX_HEALTH = 120
 
 class DscraperError(Exception):
-    damage = 0 # times workers can trigger exceptions before killing themselves
+    """A general error that Dscraper has nothing to do with it.
+    Manual retrying is not recommended until the problem causing this error is
+    solved, because Dscraper has retried automatically.
+    """
+    damage = 0 # too many exceptions triggered will kill the scraper
 
-class ConnectionError(DscraperError, OSError):
-    """An error occured while trying to communicate with the host for multiple times.
+    def results_in(self, message):
+        self.args = ('{}: {}'.format(message, self.args[0]), )
 
-    Do not retry until the problem is fixed, which is probably that either
-    your IP is blocked by the host, or your Internet connection is lost.
+class HostError(DscraperError, OSError):
+    """An error occured while trying to communicate with the host.
+
+    This error is most likely caused by the host. Some frequent causes are that
+    your IP was blocked by the host, and that your Internet connection was lost.
+    The only solution is to wait.
     """
     damage = 40
 
-class ConnectTimeout(ConnectionError):
+class ConnectTimeout(HostError):
     """All attempts to connect to the host timed out."""
 
-class ResponseError(ConnectionError):
+class ResponseError(HostError):
     """The response from the host was invalid."""
 
+class NoResponseReadError(ResponseError):
+    """There is no response from the host.
+    Basically it is caused by opening a 404 page, or keeping the host waiting too long,
+    so that the connection was closed."""
+    damage = 10
+
 class DataError(DscraperError, ValueError):
-    """The data read from the response was invalid"""
+    """The data read from the response was invalid.
+
+    This error is most likely caused by the host, but even the host would not solve it.
+    Sometimes the host sends mal-formatted comments files, especially those generated
+    years ago, when the host's server was rather unstable.
+    There is no solution.
+    """
     damage = 30
 
 class DecodeError(DataError):
     """The byte array cannot be decoded."""
-    # TODO what is its damage?
 
 class ParseError(DataError):
     """The string cannot be parsed as XML or JSON."""
@@ -34,19 +58,29 @@ class InvalidCid(DscraperError, ValueError, TypeError):
     """The worker was fed with an invalid cid to work with."""
     damage = 24
 
+class MultipleErrors(DscraperError):
+    """The container of multiple errors."""
+    def __init__(self, errors):
+        super().__init__()
+        extract_info = lambda e: format_exception(e, e, None)[-1].rstrip('\n')
+        message = '{} error(s) occured: \n{}'.format(len(errors),
+                                                   ', \n'.join(map(extract_info, errors)))
+        self.args = (message,)
+        self.damage = max(errors, key=lambda e: e.damage)
+
+
 class Life:
 
     def __init__(self):
         self.health = self._max_health = _MAX_HEALTH
         self.regen = _MAX_HEALTH / 10
-        self.are_recorders_set = False
+        self.recorders = None
 
     def set_recorders(self, workers):
         num_workers = len(workers)
-        recorders = min(num_workers, 3)
-        for i, worker in enumerate(workers):
-            worker._recorder = i < recorders
         shuffle(workers)
+        num_recorders = min(num_workers, 3)
+        self.recorders = frozenset(workers[:num_recorders])
 
         self.health = self._max_health = _MAX_HEALTH * recorders
         self.regen = _MAX_HEALTH / 10 * (recorders / num_workers)
@@ -56,9 +90,10 @@ class Life:
         self.health = min(self.health + self.regen, self._max_health)
 
     def damage(self, worker, e):
-        if (self.are_recorders_set and not work._recorder) or e.damage <= 0:
+        if (self.recorders is None or work not in self.recorders) or e.damage <= 0:
             return
         self.health -= e.damage
 
     def is_dead(self):
         return self.health <= 0
+
