@@ -1,40 +1,13 @@
 from functools import update_wrapper
-from abc import ABCMeta, abstractmethod
 import warnings
 import asyncio
 import re
 
+from .exceptions import ConnectTimeout, MultipleErrors
+
 def decorator(d):
     return lambda f: update_wrapper(d(f), f)
 decorator = decorator(decorator)
-
-@decorator
-def alock(coro):
-    if not asyncio.iscoroutinefunction(coro):
-        raise TypeError('not a coroutine function')
-    # @asyncio.coroutine
-    async def _coro(*args, **kwargs):
-        # not good
-        # raise RuntimeError('coroutine already running')
-
-        # not working
-        # if _coro._locking:
-        #     asyncio.ensure_future(_coro(*args, **kwargs))
-        #     return
-
-        # TODO not graceful
-        while _coro._locking:
-            await asyncio.sleep(0.1)
-
-        _coro._locking = True
-        try:
-            return await coro(*args, **kwargs)
-        finally:
-            _coro._locking = False
-
-    _coro._locking = False
-
-    return _coro
 
 @decorator
 def trace(f):
@@ -61,12 +34,42 @@ def trace(f):
 
     trace._traced = 0
     trace._depth = 0
-    signature = '{name}({args})'
-    indent = '   '
-    format_in = '{indent}{signature} -> #{tid}'
-    format_out = '{indent}{result} <- #{tid}'
 
     return _f
+
+signature = '{name}({args})'
+indent = '   '
+format_in = '{indent}{signature} -> #{tid}'
+format_out = '{indent}{result} <- #{tid}'
+
+def aretry(exc, exc_handler=None):
+    @decorator
+    def _true_decorator(coro):
+        async def _f(*args, **kwargs):
+            errors = []
+            tries = 0
+            while True:
+                try:
+                    return await coro(*args, **kwargs)
+                except exc as e:
+                    errors.append(e)
+                if tries >= _RETRIES:
+                    raise MultipleErrors(errors)
+                tries += 1
+                if _f._exc_handler:
+                    try:
+                        await _f._exc_handler()
+                    except TypeError:
+                        self = args[0]
+                        _f._exc_handler = getattr(self, _f._exc_handler)
+                        await _f._exc_handler()
+
+        _f._exc_handler = exc_handler
+
+        return _f
+    return _true_decorator
+
+_RETRIES = 2
 
 
 def get_headers_text(headers):
@@ -92,12 +95,9 @@ def is_response_complete(raw):
     return False
 
 
-_RETRIES = 2
-
-class AutoConnector(metaclass=ABCMeta):
+class AutoConnector:
 
     def __init__(self, timeout):
-        self._connected = False
         self._timeout = timeout
 
     async def __aenter__(self):
@@ -107,32 +107,16 @@ class AutoConnector(metaclass=ABCMeta):
     async def __aexit__(self, exc_type, exc, tb):
         self.disconnect()
 
+    @aretry(ConnectTimeout)
     async def connect(self):
-        if self._connected:
-            warnings.warn('Connector is connected when connect() is called')
-            self.disconnect()
-        # if connection timed out, retry
-        for tries in range(1, _RETRIES + 1):
-            try:
-                await asyncio.wait_for(self.on_connect(), self._timeout)
-            except asyncio.TimeoutError:
-                pass
-            else:
-                self.connected = True
-                return
-        raise ConnectTimeout('max retries exceeded')
+        try:
+            return await asyncio.wait_for(self._open_connection(), self._timeout)
+        except asyncio.TimeoutError as e:
+            raise ConnectTimeout('connection timed out') from e
 
     def disconnect(self):
-        if self._connected:
-            self.on_disconnect()
-            self._connected = False
-        else:
-            warnings.warn('Connector is not connected when disconnect() is called')
+        raise NotImplementedError
 
-    @abstractmethod
-    async def on_connect(self):
-        pass
+    async def _open_connection(self):
+        raise NotImplementedError
 
-    @abstractmethod
-    def on_disconnect(self):
-        pass

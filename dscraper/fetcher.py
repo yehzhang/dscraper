@@ -6,13 +6,14 @@ import zlib
 import xmltodict as x2d
 import json
 
-from .utils import alock, AutoConnector, get_headers_text, is_response_complete, get_status_code
-from .exceptions import ConnectionError, ConnectTimeout, ResponseError, DecodeError, ParseError
+from .utils import aretry, AutoConnector, get_headers_text, is_response_complete, get_status_code
+from .exceptions import HostError, ConnectTimeout, ResponseError, DecodeError, ParseError, MultipleErrors, NoResponseReadError
 
 _logger = logging.getLogger(__name__)
 
 
 _HOST = 'comment.bilibili.tv'
+_PORT = 80
 _REQUEST_TEMPLATE = 'GET {{uri}} HTTP/1.1\r\n{headers}\r\n'
 _DEFAULT_HEADERS = {
     'Host': _HOST,
@@ -20,6 +21,7 @@ _DEFAULT_HEADERS = {
 }
 # TODO: switch to backup headers if necessary
 _BACKUP_HEADERS = {
+# _DEFAULT_HEADERS = {
     'Host': _HOST,
     'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_10_4) AppleWebKit/600.7.12 (KHTML, like Gecko) Version/8.0.7 Safari/600.7.12',
     'Referer': 'http://www.baidu.com/',
@@ -27,13 +29,15 @@ _BACKUP_HEADERS = {
     'Accept-Encoding': 'gzip, deflate'
 }
 
+
 class Fetcher:
 
     def __init__(self, loop=None):
-        self.session = Session(loop)
+        self.session = Session(_HOST, _PORT, loop)
         self.headers = _DEFAULT_HEADERS
-        self.template = _REQUEST_TEMPLATE.format(headers=
+        self.request_template = _REQUEST_TEMPLATE.format(headers=
                             get_headers_text(self.headers))
+        self._locking = False
 
     async def __aenter__(self):
         await self.open()
@@ -43,48 +47,38 @@ class Fetcher:
         self.close()
 
     async def open(self):
-        await self.session.connect()
+        try:
+            await self.session.connect()
+        except ConnectTimeout as e:
+            _logger.warning('Failed to connect to the host')
+            e.results_in('cannot connect to the host')
+            raise
 
     def close(self):
         self.session.disconnect()
 
-    @alock
-    @asyncio.coroutine
-    def fetch(self, uri):
-        """raise ConnectionError(, ConnectTimeout), DecodeError"""
-        request = self.template.format(uri=uri).encode('ascii')
+    async def fetch(self, uri):
+        """raise HostError, DecodeError
+        Has coroutine lock
+        """
+        if self._locking:
+            raise RuntimeError('coroutine already running')
+        try:
+            self._locking = True
+            return await self._fetch(uri)
+        finally:
+            self._locking = False
 
-        # if ConnectionError occurred, retry
-        retries = 0
-        while True:
+    async def _fetch(self, uri):
+        # make the request text
+        request = self.request_template.format(uri=uri).encode('ascii')
 
-            try:
-                # send the request
-                yield from self.session.send(request)
-
-                # read the response
-                response = yield from self.session.read()
-
-                # disassemble the response
-                try:
-                    headers, body = response.split(b'\r\n\r\n', maxsplit=1)
-                except ValueError:
-                    _logger.info('Response from %s was invalid', uri)
-                    _logger.debug('response: \n%s', response)
-                    raise ResponseError('invalid response')
-
-            except ConnectionError as e:
-                # guarding condition
-                if retries >= _RETRIES:
-                    _logger.warning('Failed to read from %s after %d retries', uri, _RETRIES)
-                    raise ConnectionError('cannot read from {}'.format(uri)) from e
-
-            else:
-                break
-
-            retries += 1
-            _logger.info('Trying to solve this problem by reconnecting to the host')
-            yield from self.session.connect()
+        # try to get the response
+        try:
+            headers, body = await self.session.get(request)
+        except (ConnectTimeout, MultipleErrors) as e:
+            _logger.warning('Failed to read from %s', uri)
+            raise HostError('cannot read from {}'.format(uri)) from e
 
         # check the status code
         if get_status_code(headers) == 404:
@@ -146,27 +140,43 @@ class Fetcher:
             raise ParseError('content cannot be parsed as JSON') from e
         return json
 
-_PORT = 80
-_CONNECT_TIMEOUT = 7
-_READ_TIMEOUT = 14
 
 class Session(AutoConnector):
 
-    def __init__(self, loop):
+    def __init__(self, host, port, loop):
         super().__init__(_CONNECT_TIMEOUT)
-        self.reader = self.writer = None
+        self.host = host
+        self.port = port
         self.loop = loop
+        self.reader = self.writer = None
 
-    async def send(self, request):
+    @aretry(HostError, 'connect')
+    async def get(self, request):
+        # send the request
         self.writer.write(request)
         try:
             await self.writer.drain()
-        except ConnectionResetError as e:
-            _logger.info('Connection to %s was reset', uri)
-            raise ConnectionError('connection reset') from e
+        except ConnectionError as e:
+            _logger.info('Connection to the host was reset')
+            raise HostError('connection reset') from e
+
+        # read the response
+        response = await self.read()
+        if not response:
+            _logger.debug('No response from the host on %s', request)
+            raise NoResponseReadError('no response from the host')
+
+        # disassemble the response to check completeness
+        try:
+            headers, body = response.split(b'\r\n\r\n', maxsplit=1)
+        except ValueError:
+            _logger.info('Response from the host was invalid')
+            _logger.debug('response: \n%s', response)
+            raise ResponseError('invalid response')
+        else:
+            return (headers, body)
 
     async def read(self):
-        # _logger.debug('read start')
         # TODO no data from host time-out / read time-out
         # shield, wait_for
         response = b''
@@ -175,20 +185,17 @@ class Session(AutoConnector):
             if not chunk:
                 break
             response += chunk
-        # _logger.debug('read over')
         return response
 
-    async def on_connect(self):
-        self.reader, self.writer = await asyncio.open_connection(_HOST, _PORT, loop=self.loop)
+    async def _open_connection(self):
+        if self.writer:
+            self.disconnect()
+            _logger.debug('Trying to reconnect to the host')
+        self.reader, self.writer = await asyncio.open_connection(self.host, self.port, loop=self.loop)
 
-    def on_disconnect(self):
+    def disconnect(self):
         self.writer.close()
         self.reader = self.writer = None
 
-    async def connect(self):
-        try:
-            await super().connect()
-        except ConnectTimeout as e:
-            _logger.warning('Failed to connect to the host after maximum retries')
-            e.args = ('cannot connect to the host: ' + e.args[0], )
-            raise
+_CONNECT_TIMEOUT = 7
+_READ_TIMEOUT = 14
