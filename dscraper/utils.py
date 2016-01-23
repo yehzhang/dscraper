@@ -60,8 +60,11 @@ def aretry(exc, exc_handler=None):
                     try:
                         await _f._exc_handler()
                     except TypeError:
-                        self = args[0]
-                        _f._exc_handler = getattr(self, _f._exc_handler)
+                        # pass in 'self.method' to call a class method
+                        names = exc_handler.split('.')
+                        if len(names) != 2 or name[0] != 'self':
+                            raise ValueError('{} is not a valid function nor method'.format(repr(exc_handler)))
+                        _f._exc_handler = getattr(args[0], _f._exc_handler)
                         await _f._exc_handler()
 
         _f._exc_handler = exc_handler
@@ -99,13 +102,6 @@ class AutoConnector:
 
     def __init__(self, timeout):
         self._timeout = timeout
-
-    async def __aenter__(self):
-        await self.connect()
-        return self
-
-    async def __aexit__(self, exc_type, exc, tb):
-        self.disconnect()
 
     @aretry(ConnectTimeout)
     async def connect(self):

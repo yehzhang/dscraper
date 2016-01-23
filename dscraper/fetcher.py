@@ -150,7 +150,7 @@ class Session(AutoConnector):
         self.loop = loop
         self.reader = self.writer = None
 
-    @aretry(HostError, 'connect')
+    @aretry(HostError, 'self.connect')
     async def get(self, request):
         # send the request
         self.writer.write(request)
