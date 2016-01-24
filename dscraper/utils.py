@@ -2,8 +2,10 @@ from functools import update_wrapper
 import warnings
 import asyncio
 import re
+import xmltodict as x2d
+import json
 
-from .exceptions import ConnectTimeout, MultipleErrors
+from .exceptions import ConnectTimeout, MultipleErrors, ParseError
 
 def decorator(d):
     return lambda f: update_wrapper(d(f), f)
@@ -74,6 +76,14 @@ def aretry(exc, exc_handler=None):
 
 _RETRIES = 2
 
+@decorator
+def alock(coro):
+    async def _coro(*args, **kwargs):
+        async with lock:
+            return await coro(*args, **kwargs)
+    lock = asyncio.Lock()
+    return _coro
+
 
 def get_headers_text(headers):
     return ''.join('{}:{}\r\n'.format(k, v) for k, v in headers.items())
@@ -96,6 +106,8 @@ def is_response_complete(raw):
             content_length = int(match.group(1))
             return len(upperbody) == content_length
     return False
+
+
 
 
 class AutoConnector:
