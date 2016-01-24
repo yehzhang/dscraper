@@ -14,8 +14,8 @@ class DscraperError(Exception):
     """
     damage = 0 # too many exceptions triggered will kill the scraper
 
-    def results_in(self, message):
-        self.args = ('{}: {}'.format(message, self.args[0]), )
+    def results_in(self, consequence):
+        self.args = ('{}: {}'.format(consequence, self.args[0]), )
 
 class HostError(DscraperError, OSError):
     """An error occured while trying to communicate with the host.
@@ -35,7 +35,7 @@ class ResponseError(HostError):
 class NoResponseReadError(ResponseError):
     """There is no response from the host.
     Basically it is caused by opening a 404 page, or keeping the host waiting too long,
-    so that the connection was closed."""
+    so that the connection was closed. This exception occurs frequently."""
     damage = 10
 
 class DataError(DscraperError, ValueError):
@@ -53,6 +53,10 @@ class DecodeError(DataError):
 
 class ParseError(DataError):
     """The string cannot be parsed as XML or JSON."""
+
+class ContentError(DataError):
+    """The recieved xml contains only a single element with 'error' as content."""
+    damage = 0
 
 class InvalidCid(DscraperError, ValueError, TypeError):
     """The worker was fed with an invalid cid to work with."""
