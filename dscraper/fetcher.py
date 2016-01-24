@@ -3,11 +3,9 @@ __all__ = ('Fetcher', )
 import logging
 import asyncio
 import zlib
-import xmltodict as x2d
-import json
 
 from .utils import aretry, AutoConnector, get_headers_text, is_response_complete, get_status_code
-from .exceptions import HostError, ConnectTimeout, ResponseError, DecodeError, ParseError, MultipleErrors, NoResponseReadError
+from .exceptions import HostError, ConnectTimeout, ResponseError, DecodeError, MultipleErrors, NoResponseReadError
 
 _logger = logging.getLogger(__name__)
 
@@ -57,19 +55,9 @@ class Fetcher:
     def close(self):
         self.session.disconnect()
 
+    @alock
     async def fetch(self, uri):
-        """raise HostError, DecodeError
-        Has coroutine lock
-        """
-        if self._locking:
-            raise RuntimeError('coroutine already running')
-        try:
-            self._locking = True
-            return await self._fetch(uri)
-        finally:
-            self._locking = False
-
-    async def _fetch(self, uri):
+        """raises HostError, DecodeError"""
         # make the request text
         request = self.request_template.format(uri=uri).encode('ascii')
 
@@ -87,6 +75,7 @@ class Fetcher:
 
         # inflate and decode the body
         try:
+            # TODO zlib.eof?
             inflated = zlib.decompressobj(-zlib.MAX_WBITS).decompress(body)
             return inflated.decode()
         except (zlib.error, UnicodeDecodeError) as e:
@@ -99,46 +88,17 @@ class Fetcher:
             uri = '/{}.xml'.format(cid)
         else:
             uri = '/dmroll,{},{}'.format(timestamp, cid)
-        # expected outcome:
-        #   valid XML string, √
-        #   no outcome / 404 not found, √
-        #   XML string containing a single element with 'error' as content, or
-        #   XML string with invalid characters
-        # exception:
-        #   connection timed out
-        #   cannot decode
         text = await self.fetch(uri)
-
         if not text:
             return None
-        try:
-            xml = x2d.parse(text)
-        except Exception as e: # TODO what exception means what?
-            _logger.warning('Failed to parse the content as XML at cid %s: %s', cid, e)
-            raise ParseError('content cannot be parsed as XML') from e
-        # TODO
-        # if :
-        #     pass
-        return xml
+        return text
 
     async def fetch_rolldate(self, cid):
         uri = '/rolldate,{}'.format(cid)
-        # expected outcome:
-        #   valid JSON string, √
-        #   no outcome / 404 not found, √
-        # exception:
-        #   connection timed out
-        #   cannot decode
         text = await self.fetch(uri)
-
         if not text:
             return None
-        try:
-            json = json.loads(text)
-        except json.JSONDecodeError as e:
-            _logger.warning('Failed to parse the content as JSON at cid %s: %s', cid, e)
-            raise ParseError('content cannot be parsed as JSON') from e
-        return json
+        return text
 
 
 class Session(AutoConnector):

@@ -107,7 +107,25 @@ def is_response_complete(raw):
             return len(upperbody) == content_length
     return False
 
+def parse_xml(text):
+    # TODO
+    #   XML string containing a single element with 'error' as content, or
+    #   XML string with invalid characters
+    try:
+        xml = x2d.parse(text)
+    except Exception as e: # TODO what exception means what?
+        raise ParseError('content cannot be parsed as XML') from e
+    return xml
 
+def parse_json(text):
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError as e:
+        raise ParseError('content cannot be parsed as JSON') from e
+
+def merge_xmls(xmls):
+    # TODO
+    pass
 
 
 class AutoConnector:
