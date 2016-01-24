@@ -114,14 +114,14 @@ def parse_xml(text):
     try:
         xml = x2d.parse(text)
     except Exception as e: # TODO what exception means what?
-        raise ParseError('content cannot be parsed as XML') from e
+        raise ParseError('cannot parse as XML') from e
     return xml
 
 def parse_json(text):
     try:
         return json.loads(text)
     except json.JSONDecodeError as e:
-        raise ParseError('content cannot be parsed as JSON') from e
+        raise ParseError('cannot parse as JSON') from e
 
 def merge_xmls(xmls):
     # TODO
@@ -130,17 +130,25 @@ def merge_xmls(xmls):
 
 class AutoConnector:
 
-    def __init__(self, timeout):
+    def __init__(self, timeout, loop=None):
         self._timeout = timeout
+        self.loop = loop
+
+    async def __aenter__(self):
+        await self.connect()
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb):
+        await self.disconnect()
 
     @aretry(ConnectTimeout)
     async def connect(self):
         try:
-            return await asyncio.wait_for(self._open_connection(), self._timeout)
+            return await asyncio.wait_for(self._open_connection(), self._timeout, loop=self.loop)
         except asyncio.TimeoutError as e:
             raise ConnectTimeout('connection timed out') from e
 
-    def disconnect(self):
+    async def disconnect(self):
         raise NotImplementedError
 
     async def _open_connection(self):
