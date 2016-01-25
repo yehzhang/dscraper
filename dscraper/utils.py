@@ -44,39 +44,6 @@ indent = '   '
 format_in = '{indent}{signature} -> #{tid}'
 format_out = '{indent}{result} <- #{tid}'
 
-def aretry(exc, exc_handler=None):
-    @decorator
-    def _true_decorator(coro):
-        async def _f(*args, **kwargs):
-            errors = []
-            tries = 0
-            while True:
-                try:
-                    return await coro(*args, **kwargs)
-                except exc as e:
-                    errors.append(e)
-                if tries >= _RETRIES:
-                    # TODO if same errors, return itself
-                    raise MultipleErrors(errors)
-                tries += 1
-                if _f._exc_handler:
-                    try:
-                        await _f._exc_handler()
-                    except TypeError:
-                        # pass in 'self.method' to call a class method
-                        names = exc_handler.split('.')
-                        if len(names) != 2 or name[0] != 'self':
-                            raise ValueError('{} is not a valid function nor method'.format(repr(exc_handler)))
-                        _f._exc_handler = getattr(args[0], _f._exc_handler)
-                        await _f._exc_handler()
-
-        _f._exc_handler = exc_handler
-
-        return _f
-    return _true_decorator
-
-_RETRIES = 2
-
 @decorator
 def alock(coro):
     async def _coro(*args, **kwargs):
@@ -154,12 +121,13 @@ class AutoConnector:
     async def __aexit__(self, exc_type, exc, tb):
         await self.disconnect()
 
-    @aretry(ConnectTimeout)
     async def connect(self):
-        try:
-            return await asyncio.wait_for(self._open_connection(), self._timeout, loop=self.loop)
-        except asyncio.TimeoutError as e:
-            raise ConnectTimeout('connection timed out') from e
+        for tries in range(_CONNECT_RETRIES + 1):
+            try:
+                return await asyncio.wait_for(self._open_connection(), self._timeout, loop=self.loop)
+            except asyncio.TimeoutError:
+                pass
+        raise ConnectTimeout('connection timed out')
 
     async def disconnect(self):
         raise NotImplementedError
@@ -167,3 +135,4 @@ class AutoConnector:
     async def _open_connection(self):
         raise NotImplementedError
 
+_CONNECT_RETRIES = 2

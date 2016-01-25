@@ -3,7 +3,7 @@ __all__ = ('Fetcher', )
 import logging
 import asyncio
 
-from .utils import aretry, AutoConnector, get_headers_text, is_response_complete, get_status_code, inflate_and_decode
+from .utils import AutoConnector, get_headers_text, is_response_complete, get_status_code, inflate_and_decode
 from .exceptions import HostError, ConnectTimeout, ResponseError, DecodeError, MultipleErrors, NoResponseReadError
 
 _logger = logging.getLogger(__name__)
@@ -105,8 +105,18 @@ class Session(AutoConnector):
             e.results_in('cannot connect to the host')
             raise
 
-    @aretry(HostError, 'self.connect')
     async def get(self, request):
+        errors = []
+        for tries in range(_READ_RETRIES + 1):
+            try:
+                return await self._get(request)
+            except HostError as e:
+                errors.append(e)
+                await self.connect()
+        # TODO if same errors, return the error itself
+        raise MultipleErrors(errors)
+
+    async def _get(self, request):
         # send the request
         self.writer.write(request)
         try:
@@ -154,3 +164,4 @@ class Session(AutoConnector):
 
 _CONNECT_TIMEOUT = 7
 _READ_TIMEOUT = 14
+_READ_RETRIES = 2
