@@ -2,7 +2,7 @@ from functools import update_wrapper
 import warnings
 import asyncio
 import re
-import xmltodict as x2d
+import xml.etree.ElementTree as et
 import json
 
 from .exceptions import ConnectTimeout, MultipleErrors, ParseError
@@ -56,6 +56,7 @@ def aretry(exc, exc_handler=None):
                 except exc as e:
                     errors.append(e)
                 if tries >= _RETRIES:
+                    # TODO if same errors, return itself
                     raise MultipleErrors(errors)
                 tries += 1
                 if _f._exc_handler:
@@ -107,15 +108,27 @@ def is_response_complete(raw):
             return len(upperbody) == content_length
     return False
 
+def inflate_and_decode(raw):
+    try:
+        # TODO zlib.eof?
+        inflated = zlib.decompressobj(-zlib.MAX_WBITS).decompress(raw)
+        return inflated.decode()
+    except (zlib.error, UnicodeDecodeError) as e:
+        _logger.warning('Failed to decode the data: %s', e)
+        _logger.debug('cannot decode: \n%s', raw)
+        raise DecodeError('cannot decode the response') from e
+
 def parse_xml(text):
     # TODO
     #   XML string containing a single element with 'error' as content, or
+    # _logger.info('The XML of comments contains a single "error" element')
     #   XML string with invalid characters
     try:
-        xml = x2d.parse(text)
-    except Exception as e: # TODO what exception means what?
+        root = et.fromstring(text)
+    except et.ParseError as e: # TODO what exception means what?
+        _logger.warning('Failed to parse the XML data: %s', e)
         raise ParseError('cannot parse as XML') from e
-    return xml
+    return root
 
 def parse_json(text):
     try:
