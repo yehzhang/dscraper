@@ -2,9 +2,8 @@ __all__ = ('Fetcher', )
 
 import logging
 import asyncio
-import zlib
 
-from .utils import aretry, AutoConnector, get_headers_text, is_response_complete, get_status_code
+from .utils import aretry, AutoConnector, get_headers_text, is_response_complete, get_status_code, inflate_and_decode
 from .exceptions import HostError, ConnectTimeout, ResponseError, DecodeError, MultipleErrors, NoResponseReadError
 
 _logger = logging.getLogger(__name__)
@@ -38,22 +37,17 @@ class Fetcher:
         self._locking = False
 
     async def __aenter__(self):
-        await self.open()
+        await self.session.connect()
         return self
 
     async def __aexit__(self, exc_type, exc, tb):
-        self.close()
+        await self.session.disconnect()
 
     async def open(self):
-        try:
-            await self.session.connect()
-        except ConnectTimeout as e:
-            _logger.warning('Failed to connect to the host')
-            e.results_in('cannot connect to the host')
-            raise
+        await self.session.connect()
 
-    def close(self):
-        self.session.disconnect()
+    async def close(self):
+        await self.session.disconnect()
 
     @alock
     async def fetch(self, uri):
@@ -65,8 +59,8 @@ class Fetcher:
         try:
             headers, body = await self.session.get(request)
         except (ConnectTimeout, MultipleErrors) as e:
-            _logger.warning('Failed to read from %s', uri)
-            raise HostError('cannot read from {}'.format(uri)) from e
+            _logger.warning('Failed to read from the host: %s', e)
+            raise HostError('cannot read from the host') from e
 
         # check the status code
         if get_status_code(headers) == 404:
@@ -74,14 +68,7 @@ class Fetcher:
             return None
 
         # inflate and decode the body
-        try:
-            # TODO zlib.eof?
-            inflated = zlib.decompressobj(-zlib.MAX_WBITS).decompress(body)
-            return inflated.decode()
-        except (zlib.error, UnicodeDecodeError) as e:
-            _logger.warning('Failed to decode the data from %s: %s', uri, e)
-            _logger.debug('cannot decode: \n%s', body)
-            raise DecodeError('cannot decode the response') from e
+        return inflate_and_decode(body)
 
     async def fetch_comments(self, cid, timestamp=0):
         if timestamp == 0:
@@ -104,11 +91,19 @@ class Fetcher:
 class Session(AutoConnector):
 
     def __init__(self, host, port, loop):
-        super().__init__(_CONNECT_TIMEOUT)
+        super().__init__(_CONNECT_TIMEOUT, loop)
         self.host = host
         self.port = port
         self.loop = loop
         self.reader = self.writer = None
+
+    async def connect(self):
+        try:
+            await super().connect()
+        except ConnectTimeout as e:
+            _logger.warning('Failed to open connection to the host')
+            e.results_in('cannot connect to the host')
+            raise
 
     @aretry(HostError, 'self.connect')
     async def get(self, request):
@@ -153,7 +148,7 @@ class Session(AutoConnector):
             _logger.debug('Trying to reconnect to the host')
         self.reader, self.writer = await asyncio.open_connection(self.host, self.port, loop=self.loop)
 
-    def disconnect(self):
+    async def disconnect(self):
         self.writer.close()
         self.reader = self.writer = None
 
