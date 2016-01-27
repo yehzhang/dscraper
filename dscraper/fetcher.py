@@ -3,11 +3,10 @@ __all__ = ('Fetcher', )
 import logging
 import asyncio
 
-from .utils import AutoConnector, get_headers_text, is_response_complete, get_status_code, inflate_and_decode
-from .exceptions import HostError, ConnectTimeout, ResponseError, DecodeError, MultipleErrors, NoResponseReadError
+from .utils import alock, AutoConnector, get_headers_text, is_response_complete, get_status_code, inflate_and_decode
+from .exceptions import HostError, ConnectTimeout, ResponseError, DecodeError, MultipleErrors, NoResponseReadError, PageNotFound
 
 _logger = logging.getLogger(__name__)
-
 
 _HOST = 'comment.bilibili.tv'
 _PORT = 80
@@ -51,22 +50,22 @@ class Fetcher:
 
     @alock
     async def fetch(self, uri):
-        """raises HostError, DecodeError"""
+        """raises HostError, DecodeError, PageNotFound"""
+        if self.session.disconnected():
+            raise RuntimeError('fetcher is not opened yet')
         # make the request text
         request = self.request_template.format(uri=uri).encode('ascii')
-
         # try to get the response
         try:
             headers, body = await self.session.get(request)
         except (ConnectTimeout, MultipleErrors) as e:
-            _logger.warning('Failed to read from the host: %s', e)
-            raise HostError('cannot read from the host') from e
-
+            raise HostError('Failed to read from the host') from e
         # check the status code
         if get_status_code(headers) == 404:
-            _logger.info('%s is a 404 page', uri)
-            return None
-
+            # TODO after visiting 404 page, the reader keeps blocking without break immediately, yet the host says keep-alive, resulting in connection timeout. should fix it by improve read() terminating detection instead of wait for overtime and reconnect
+            await self.session.disconnect()
+            await self.session.connect()
+            raise PageNotFound('Fetching a 404 page')
         # inflate and decode the body
         return inflate_and_decode(body)
 
@@ -75,35 +74,21 @@ class Fetcher:
             uri = '/{}.xml'.format(cid)
         else:
             uri = '/dmroll,{},{}'.format(timestamp, cid)
-        text = await self.fetch(uri)
-        if not text:
-            return None
-        return text
+        return await self.fetch(uri)
 
     async def fetch_rolldate(self, cid):
         uri = '/rolldate,{}'.format(cid)
-        text = await self.fetch(uri)
-        if not text:
-            return None
-        return text
+        return await self.fetch(uri)
 
 
 class Session(AutoConnector):
 
     def __init__(self, host, port, loop):
-        super().__init__(_CONNECT_TIMEOUT, loop)
+        super().__init__(_CONNECT_TIMEOUT, loop, 'Failed to open connection to the host')
         self.host = host
         self.port = port
         self.loop = loop
         self.reader = self.writer = None
-
-    async def connect(self):
-        try:
-            await super().connect()
-        except ConnectTimeout as e:
-            _logger.warning('Failed to open connection to the host')
-            e.results_in('cannot connect to the host')
-            raise
 
     async def get(self, request):
         errors = []
@@ -122,8 +107,7 @@ class Session(AutoConnector):
         try:
             await self.writer.drain()
         except ConnectionError as e:
-            _logger.info('Connection to the host was reset')
-            raise HostError('connection reset') from e
+            raise HostError('Connection to the host was reset') from e
 
         # read the response
         response = await self.read()
@@ -135,14 +119,14 @@ class Session(AutoConnector):
         try:
             headers, body = response.split(b'\r\n\r\n', maxsplit=1)
         except ValueError:
-            _logger.info('Response from the host was invalid')
             _logger.debug('response: \n%s', response)
-            raise ResponseError('invalid response')
+            raise ResponseError('Response from the host was invalid')
         else:
             return (headers, body)
 
     async def read(self):
         # TODO no data from host time-out / read time-out
+        # TODO efficient check body length, check status code here
         # shield, wait_for
         response = b''
         while not is_response_complete(response):
@@ -154,13 +138,16 @@ class Session(AutoConnector):
 
     async def _open_connection(self):
         if self.writer:
-            self.disconnect()
+            await self.disconnect()
             _logger.debug('Trying to reconnect to the host')
         self.reader, self.writer = await asyncio.open_connection(self.host, self.port, loop=self.loop)
 
     async def disconnect(self):
         self.writer.close()
         self.reader = self.writer = None
+
+    def disconnected(self):
+        return self.writer is None
 
 _CONNECT_TIMEOUT = 7
 _READ_TIMEOUT = 14
