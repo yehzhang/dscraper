@@ -4,8 +4,13 @@ import asyncio
 import re
 import xml.etree.ElementTree as et
 import json
+import zlib
+import logging
 
 from .exceptions import ConnectTimeout, MultipleErrors, ParseError
+
+_logger = logging.getLogger(__name__)
+
 
 def decorator(d):
     return lambda f: update_wrapper(d(f), f)
@@ -76,43 +81,60 @@ def is_response_complete(raw):
     return False
 
 def inflate_and_decode(raw):
+    dobj = zlib.decompressobj(-zlib.MAX_WBITS)
     try:
-        # TODO zlib.eof?
-        inflated = zlib.decompressobj(-zlib.MAX_WBITS).decompress(raw)
+        inflated = dobj.decompress(raw)
+        inflated += dobj.flush()
         return inflated.decode()
     except (zlib.error, UnicodeDecodeError) as e:
-        _logger.warning('Failed to decode the data: %s', e)
         _logger.debug('cannot decode: \n%s', raw)
-        raise DecodeError('cannot decode the response') from e
+        raise DecodeError('Failed to decode the data from the response') from e
 
 def parse_xml(text):
-    # TODO
-    #   XML string containing a single element with 'error' as content, or
-    # _logger.info('The XML of comments contains a single "error" element')
-    #   XML string with invalid characters
+    # TODO XML string with invalid characters
     try:
         root = et.fromstring(text)
     except et.ParseError as e: # TODO what exception means what?
-        _logger.warning('Failed to parse the XML data: %s', e)
-        raise ParseError('cannot parse as XML') from e
+        raise ParseError('Failed to parse the XML data') from e
+    if root.text == 'error':
+        raise ContentError('The XML data contains a single element with "error" as content')
     return root
 
 def parse_json(text):
     try:
         return json.loads(text)
     except json.JSONDecodeError as e:
-        raise ParseError('cannot parse as JSON') from e
+        raise ParseError('Failed to parse the JSON data') from e
 
 def merge_xmls(xmls):
     # TODO
     pass
 
+def get_all_cids(cid_iters):
+    for cid_iter in cid_iters:
+        try:
+            for raw_cid in cid_iter:
+                yield raw_cid
+        except TypeError:
+            yield cid_iter
+
+def cid_checker(cid_iter):
+    for cid in cid_iter:
+        try:
+            cid = int(cid)
+        except TypeError:
+            raise InvalidCid('Invalid cid from input: an integer is required, not \'{}\''.format(type(cid).__name__))
+        if cid <= 0:
+            raise InvalidCid('Invalid cid from input: a positive integer is required')
+        yield cid
+
 
 class AutoConnector:
 
-    def __init__(self, timeout, loop=None):
+    def __init__(self, timeout, loop=None, fail_result=None):
         self._timeout = timeout
         self.loop = loop
+        self.fail_result = fail_result
 
     async def __aenter__(self):
         await self.connect()
@@ -127,7 +149,10 @@ class AutoConnector:
                 return await asyncio.wait_for(self._open_connection(), self._timeout, loop=self.loop)
             except asyncio.TimeoutError:
                 pass
-        raise ConnectTimeout('connection timed out')
+        message = 'Connection timed out'
+        if self.fail_result:
+            message = self.fail_result + ': ' + message
+        raise ConnectTimeout(message)
 
     async def disconnect(self):
         raise NotImplementedError
