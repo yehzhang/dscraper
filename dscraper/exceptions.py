@@ -6,6 +6,8 @@ from traceback import format_exception
 from random import shuffle
 import logging
 
+from .utils import capitalize
+
 _logger = logging.getLogger(__name__)
 
 class DscraperError(Exception):
@@ -81,15 +83,17 @@ class InvalidCid(DscraperError, ValueError, TypeError):
 class MultipleErrors(DscraperError):
     """The container of multiple errors."""
     def __init__(self, errors):
-        super().__init__()
-        extract_info = lambda e: format_exception(e, e, None)[-1].rstrip('\n')
-        message = '{} error(s) occured: \n{}'.format(len(errors),
-                                                   ', \n'.join(map(extract_info, errors)))
+        super().__init__('')
+        errors = set((type(e), e.args[0], e.damage) for e in errors)
+        self.types, messages, damages = zip(*errors)
+        message = '{} distinct error(s) occured: \n{}'.format(len(errors), ';\n'.join(messages))
         self.args = (message,)
-        self.damage = max(errors, key=lambda e: e.damage)
+        self.damage = max(damages)
 
 
 class Watcher:
+    """
+    """
 
     def __init__(self, log=True):
         self.log = log
@@ -109,7 +113,7 @@ class Watcher:
 
     def damage(self, e, worker):
         if self.log:
-            message = '{} at cid {}'.format(e.args[0], worker.cid)
+            message = '{} at cid {}'.format(capitalize(e.args[0]), worker.cid)
             if e.__cause__:
                 message += ': ' + e.__cause__
             _logger.log(e.level, message)

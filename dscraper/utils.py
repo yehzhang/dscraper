@@ -62,23 +62,11 @@ def get_headers_text(headers):
     return ''.join('{}:{}\r\n'.format(k, v) for k, v in headers.items())
 
 def get_status_code(raw):
-    match = re.search(b'HTTP/1.1 (\d+) ', raw)
+    match = _PATTERN_ST.search(raw)
     if match:
         return int(match.group(1))
 
-def is_response_complete(raw):
-    """Locate the end of response by looking for Content-Length.
-    If Content-Length is found in the response, read bytes of the same length only,
-    which are supposed to be the body of response.
-    """
-    parts = raw.split(b'\r\n\r\n', maxsplit=1)
-    if len(parts) == 2:
-        headers, upperbody = parts
-        match = re.search(b'Content-Length: (\d+)\r\n', headers)
-        if match:
-            content_length = int(match.group(1))
-            return len(upperbody) == content_length
-    return False
+_PATTERN_ST = re.compile(b'HTTP/1.1 (\d+) ')
 
 def inflate_and_decode(raw):
     dobj = zlib.decompressobj(-zlib.MAX_WBITS)
@@ -88,39 +76,43 @@ def inflate_and_decode(raw):
         return inflated.decode()
     except (zlib.error, UnicodeDecodeError) as e:
         _logger.debug('cannot decode: \n%s', raw)
-        raise DecodeError('Failed to decode the data from the response') from e
+        raise DecodeError('failed to decode the data from the response') from e
 
 def parse_xml(text):
     # TODO XML string with invalid characters
     try:
         root = et.fromstring(text)
     except et.ParseError as e: # TODO what exception means what?
-        raise ParseError('Failed to parse the XML data') from e
+        raise ParseError('failed to parse the XML data') from e
     if root.text == 'error':
-        raise ContentError('The XML data contains a single element with "error" as content')
+        raise ContentError('the XML data contains a single element with "error" as content')
     return root
 
 def parse_json(text):
     try:
         return json.loads(text)
     except json.JSONDecodeError as e:
-        raise ParseError('Failed to parse the JSON data') from e
+        raise ParseError('failed to parse the JSON data') from e
 
 def merge_xmls(xmls):
     # TODO
     pass
 
+def capitalize(s):
+    return s[0].upper() + s[1:]
+
+_CONNECT_RETRIES = 2
 
 class AutoConnector:
 
     template = '{}'
-    _CONNECT_RETRIES = 2
 
-    def __init__(self, timeout, loop=None, fail_result=None):
+    def __init__(self, timeout, loop, fail_message=None, retries=_CONNECT_RETRIES):
         self._timeout = timeout
         self.loop = loop
-        if fail_result:
-            self.template = fail_result + ': ' + self.template
+        self.retries = retries
+        if fail_message:
+            self.template = fail_message + ': ' + self.template
 
     async def __aenter__(self):
         await self.connect()
@@ -130,12 +122,12 @@ class AutoConnector:
         await self.disconnect()
 
     async def connect(self):
-        for tries in range(_CONNECT_RETRIES + 1):
+        for tries in range(self.retries + 1):
             try:
                 return await asyncio.wait_for(self._open_connection(), self._timeout, loop=self.loop)
             except asyncio.TimeoutError:
                 pass
-        message = self.template.format('Connection timed out')
+        message = self.template.format('connection timed out')
         raise ConnectTimeout(message)
 
     async def disconnect(self):
@@ -144,3 +136,7 @@ class AutoConnector:
     async def _open_connection(self):
         raise NotImplementedError
 
+class Retry:
+
+    def __init__(self, connect, read, ):
+        pass
