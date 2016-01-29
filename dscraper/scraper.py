@@ -1,12 +1,15 @@
 __all__ = ('Scraper', )
 
 import logging
-
+import asyncio
+from collections import deque
+from datetime import datetime
+from pytz import timezone
 
 from .fetcher import Fetcher
 from .exporter import FileExporter
 from .exceptions import (InvalidCid, DscraperError, Watcher)
-from .utils import parse_xml, parse_json, merge_xmls, get_all_cids, cid_checker
+from .utils import parse_xml, parse_json, merge_xmls, cid_filter, rec_cid_filter
 
 _logger = logging.getLogger(__name__)
 
@@ -46,18 +49,24 @@ class Scraper:
                         for _ in range(self.workers)]
         watcher.register(self.workers)
 
-    def scrape_list(self, cids):
-        """Input should be an iterable of integers"""
-        self._scrape(cid_checker(cids))
-
     def scrape_range(self, start, end):
         if start <= 0 or end < start:
-            raise ValueError('Not a valid range: [{} - {}]'.format(start, end))
+            raise ValueError('not a valid range: [{} - {}]'.format(start, end))
         self._scrape(range(start, end + 1))
 
+    def scrape_list(self, cids):
+        """
+        Parameter:
+            cids: an iterable of integers
+        """
+        self._scrape(cid_filter(cids))
+
     def scrape_mixed(self, cids):
-        """Input should be an iterable of integers and/or of iterables of integers"""
-        self._scrape(cid_checker(get_all_cids(cids)))
+        """
+        Parameter:
+            cids: an iterable of integers and/or of iterables of integers
+        """
+        self._scrape(rec_cid_filter(cids))
 
     def _scrape(self, args):
         pass
@@ -79,19 +88,20 @@ class Scraper:
 
 class Worker:
 
-    def __init__(self, cid_iter, exporter, watcher, loop, history):
+    def __init__(self, cid_iter, exporter, watcher, distributor, loop, history):
         self.targets = cid_iter
         self.exporter = exporter
         self.fetcher = Fetcher(loop=loop)
         self.watcher = watcher
         self.history = history
+        self.distributor = distributor
 
     async def scrape_all(self):
         async with self.fetcher:
             while not self.watcher.is_dead():
                 # TODO update progress, already scraped, current scraping
                 try:
-                    self._set_next_cid()
+                    self.cid = await self.distributor.claim()
                     await self._scrape_next()
                 except StopIteration:
                     break
@@ -116,6 +126,7 @@ class Worker:
         if self.history:
             root = parse_xml(text)
             # Continue only if the latest data contains comments no less than it could contain at maximum
+            # Notice: the elements in XML are not always sorted by tags, for example /12.xml
             elimit = root.find('maxlimit')
             if elimit:
                 limit = int(elimit.text)
@@ -126,17 +137,77 @@ class Worker:
         merge_xmls()
         await self.exporter.dump(self.cid, root, )
 
-    def _set_next_cid(self):
-        cid = next(self.targets)
+    async def _scrape_history(self, root):
+        # TODO
+        roll_dates = parse_json(await self.fetcher.fetch_rolldate(self.cid))
+        pass
+
+class Distributor:
+    """Distribute items on demand. Support frequency control and time zone.
+
+    :param tuple time_config: (tzinfo of the time zone where the host is,
+                               duration of pause when scraping in rush hours,
+                               start of the rush hours,
+                               end of the rush hours)
+    """
+
+    def __init__(self, loop=None, time_config=BILIBILI_TIME_CONFIG):
+        self.queue = deque()
+        self.loop = loop or asyncio.get_event_loop()
+        self.lock = asyncio.Lock(self.loop)
+        self.tz, self.interval_busy, start, end = time_config
+        if start > 23 or end < 0:
+            raise ValueError('hour must be in [0, 23]')
+        try:
+            self.rush_hours = set(hour for hour in range(start, 24)) | set(hour for hour in range(0, end + 1))
+        except TypeError as e:
+            raise TypeError('hour must be integer') from e
+        self.interval = 0
+
+    def post(self, cid_iter):
+        self.queue.append((cid for cid in cid_iter))
+
+    def post_rec(self, cid_iters):
+        # The depth of recursion is only 2 though
+        def _rec_cid_iter():
+            for cid_iter in cid_iters:
+                try:
+                    for cid in cid_iter:
+                        yield cid
+                except TypeError:
+                    yield cid_iter
+        self.post(_rec_cid_iter())
+
+    def update_interval(self):
+        hour_now = datetime.datetime.now(tz=self.tz).hour
+        self.interval = self.interval_busy if hour_now in self.rush_hours else 0
+
+    async def claim(self):
+        # Poll an item anyway
+        while True:
+            if not self.iter:
+                if self.queue:
+                    self.iter = self.queue.popleft()
+                else:
+                    raise StopIteration('no items available')
+            try:
+                cid = next(self.iter)
+            except StopIteration:
+                self.iter = None
+            else:
+                break
+        # Validate the item
         try:
             cid = int(cid)
         except TypeError:
             raise InvalidCid('Invalid cid from input: an integer is required, not \'{}\''.format(type(cid).__name__))
         if cid <= 0:
             raise InvalidCid('Invalid cid from input: a positive integer is required')
-        self.cid = cid
+        # Frequency control
+        self.update_interval()
+        if self.interval > 0:
+            await self.lock.acquire()
+            self.loop.call_later(self.interval, self.lock.release)
+        return cid
 
-    async def _scrape_history(self, root):
-        # TODO
-        roll_dates = parse_json(await self.fetcher.fetch_rolldate(self.cid))
-        pass
+BILIBILI_TIME_CONFIG = (pytz.timezone('Asia/Shanghai'), 1, 7, 10)

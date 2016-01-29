@@ -110,31 +110,17 @@ def merge_xmls(xmls):
     # TODO
     pass
 
-def get_all_cids(cid_iters):
-    for cid_iter in cid_iters:
-        try:
-            for raw_cid in cid_iter:
-                yield raw_cid
-        except TypeError:
-            yield cid_iter
-
-def cid_checker(cid_iter):
-    for cid in cid_iter:
-        try:
-            cid = int(cid)
-        except TypeError:
-            raise InvalidCid('Invalid cid from input: an integer is required, not \'{}\''.format(type(cid).__name__))
-        if cid <= 0:
-            raise InvalidCid('Invalid cid from input: a positive integer is required')
-        yield cid
-
 
 class AutoConnector:
+
+    template = '{}'
+    _CONNECT_RETRIES = 2
 
     def __init__(self, timeout, loop=None, fail_result=None):
         self._timeout = timeout
         self.loop = loop
-        self.fail_result = fail_result
+        if fail_result:
+            self.template = fail_result + ': ' + self.template
 
     async def __aenter__(self):
         await self.connect()
@@ -149,9 +135,7 @@ class AutoConnector:
                 return await asyncio.wait_for(self._open_connection(), self._timeout, loop=self.loop)
             except asyncio.TimeoutError:
                 pass
-        message = 'Connection timed out'
-        if self.fail_result:
-            message = self.fail_result + ': ' + message
+        message = self.template.format('Connection timed out')
         raise ConnectTimeout(message)
 
     async def disconnect(self):
@@ -160,4 +144,3 @@ class AutoConnector:
     async def _open_connection(self):
         raise NotImplementedError
 
-_CONNECT_RETRIES = 2
