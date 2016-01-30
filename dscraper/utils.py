@@ -114,19 +114,14 @@ class AutoConnector:
         if fail_message:
             self.template = fail_message + ': ' + self.template
 
-    async def __aenter__(self):
-        await self.connect()
-        return self
-
-    async def __aexit__(self, exc_type, exc, tb):
-        await self.disconnect()
-
     async def connect(self):
+        backoff = 0
         for tries in range(self.retries + 1):
             try:
                 return await asyncio.wait_for(self._open_connection(), self._timeout, loop=self.loop)
             except asyncio.TimeoutError:
-                pass
+                await asyncio.sleep(backoff)
+                backoff = backoff ** 2 if backoff > 0 else 1
         message = self.template.format('connection timed out')
         raise ConnectTimeout(message)
 

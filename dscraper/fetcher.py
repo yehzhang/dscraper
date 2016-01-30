@@ -1,5 +1,3 @@
-__all__ = ('Fetcher', )
-
 import logging
 import asyncio
 import re
@@ -17,7 +15,6 @@ class Fetcher:
     headers = {
         'User-Agent': 'dscraper/1.0'
     }
-    _REQUEST_TEMPLATE = 'GET {{uri}} HTTP/1.1\r\n{headers}\r\n'
     # TODO: switch to backup headers if necessary
     _BACKUP_HEADERS = {
         'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_10_4) AppleWebKit/600.7.12 (KHTML, like Gecko) Version/8.0.7 Safari/600.7.12',
@@ -26,13 +23,15 @@ class Fetcher:
         'Accept-Encoding': 'gzip, deflate',
         'Connection': 'keep-alive'
     }
+    _REQUEST_TEMPLATE = 'GET {{uri}} HTTP/1.1\r\n{headers}\r\n'
+
     def __init__(self, loop=None, *, host=_HOST, port=_PORT, headers=None):
         self.session = Session(host, port, loop)
         if headers:
             self.headers = headers
         self.headers['Host'] = host
         self.template = self._REQUEST_TEMPLATE.format(headers=
-                                                              get_headers_text(self.headers))
+                                                      get_headers_text(self.headers))
 
     async def __aenter__(self):
         await self.session.connect()
@@ -48,9 +47,12 @@ class Fetcher:
         await self.session.disconnect()
 
     async def get(self, uri):
-        """
+        """Fetch the content.
+        Do not await this coroutine while it is already awaited somewhere else.
+        Instead create multiple Fetcher objects.
+
         :param string uri: the URI to fetch content from
-        raises HostError, DecodeError, PageNotFound
+        :raise: HostError, DecodeError, PageNotFound
         """
         # make the request text
         request = self.template.format(uri=uri).encode('ascii')
@@ -85,6 +87,8 @@ class Session(AutoConnector):
     _READ_RETRIES = 2
     _PATTERN_TE = re.compile(b'Transfer-Encoding: chunked\r\n')
     _PATTERN_CL = re.compile(b'Content-Length: (\d+)\r\n')
+    _LINE_BREAK = b'\r\n'
+    _DOUBLE_BREAK = b'\r\n\r\n'
 
     def __init__(self, host, port, timeout=_DEFAULT_TIMEOUT, loop):
         self.connect_timeout, self.read_timeout = timeout
@@ -130,7 +134,7 @@ class Session(AutoConnector):
             raise NoResponseReadError('no response from the host')
         # disassemble the response to check integrity
         try:
-            headers, body = response.split(b'\r\n\r\n', maxsplit=1)
+            headers, body = response.split(self._DOUBLE_BREAK, maxsplit=1)
         except ValueError as e:
             _logger.debug('response: \n%s', response)
             raise ResponseError('response from the host was invalid') from e
@@ -153,19 +157,18 @@ class Session(AutoConnector):
             match = self._PATTERN_TE.search(response)
             if match:
                 try:
-                    length, content = chunk.split(b'\r\n', maxsplit=1)
+                    length, content = chunk.split(self._LINE_BREAK, maxsplit=1)
                 except ValueError:
                     pass
                 else:
-                    if int(length) > 0:
-                        response += content.rstrip(b'\r\n')
-                    else:
+                    if int(length) <= 0:
                         break
+                    response += content.rstrip(self._LINE_BREAK)
             else:
                 response += chunk
                 # Check if the response contains the 'Content-Length' header
                 try:
-                    headers, body = response.split(b'\r\n\r\n', maxsplit=1)
+                    headers, body = response.split(self._DOUBLE_BREAK, maxsplit=1)
                 except ValueError:
                     pass
                 else:

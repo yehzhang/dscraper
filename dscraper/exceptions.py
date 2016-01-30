@@ -58,8 +58,8 @@ class PageNotFound(ResponseError):
 class DataError(DscraperError, ValueError):
     """The data read from the response was invalid.
     This error is most likely caused by the host, but even the host would not solve it.
-    Sometimes the host sends mal-formatted comments files, especially those generated
-    years ago, when the host's server was rather unstable.
+    Sometimes the host sends mal-formatted files, especially when you scrape those generated
+    years ago, when the host's server was rather buggy at that time.
     There is no solution.
     """
     damage = 30
@@ -91,7 +91,7 @@ class MultipleErrors(DscraperError):
         self.damage = max(damages)
 
 
-class Watcher:
+class Scavenger:
     """
     """
 
