@@ -1,4 +1,5 @@
 from functools import update_wrapper
+import collections
 import warnings
 import asyncio
 import re
@@ -81,8 +82,6 @@ def inflate_and_decode(raw):
         raise DecodeError('failed to decode the data from the response') from e
 
 def parse_comments_xml(text):
-    # Escape invalid chracters with their hexadecimal notations
-    text = _PATTERN_ILL_XML_CHR.sub(_REPL_ILL_XML_CHR, text)
     try:
         root = et.fromstring(text)
     except et.ParseError as e:
@@ -92,18 +91,22 @@ def parse_comments_xml(text):
     # TODO split attrs
     return root
 
+def strip_invalid_xml_chars(text):
+    """Escape invalid XML chracters with their hexadecimal notations."""
+    return _PATTERN_ILL_XML_CHR.sub(_REPL_ILL_XML_CHR, text)
+
 illegal_xml_chrs = [(0x00, 0x08), (0x0B, 0x0C),
-                     (0x0E, 0x1F), (0x7F, 0x84),
-                     (0x86, 0x9F), (0xFDD0, 0xFDDF),
-                     (0xFFFE, 0xFFFF), (0x1FFFE, 0x1FFFF),
-                     (0x2FFFE, 0x2FFFF), (0x3FFFE, 0x3FFFF),
-                     (0x4FFFE, 0x4FFFF), (0x5FFFE, 0x5FFFF),
-                     (0x6FFFE, 0x6FFFF), (0x7FFFE, 0x7FFFF),
-                     (0x8FFFE, 0x8FFFF), (0x9FFFE, 0x9FFFF),
-                     (0xAFFFE, 0xAFFFF), (0xBFFFE, 0xBFFFF),
-                     (0xCFFFE, 0xCFFFF), (0xDFFFE, 0xDFFFF),
-                     (0xEFFFE, 0xEFFFF), (0xFFFFE, 0xFFFFF),
-                     (0x10FFFE, 0x10FFFF)]
+                    (0x0E, 0x1F), (0x7F, 0x84),
+                    (0x86, 0x9F), (0xFDD0, 0xFDDF),
+                    (0xFFFE, 0xFFFF), (0x1FFFE, 0x1FFFF),
+                    (0x2FFFE, 0x2FFFF), (0x3FFFE, 0x3FFFF),
+                    (0x4FFFE, 0x4FFFF), (0x5FFFE, 0x5FFFF),
+                    (0x6FFFE, 0x6FFFF), (0x7FFFE, 0x7FFFF),
+                    (0x8FFFE, 0x8FFFF), (0x9FFFE, 0x9FFFF),
+                    (0xAFFFE, 0xAFFFF), (0xBFFFE, 0xBFFFF),
+                    (0xCFFFE, 0xCFFFF), (0xDFFFE, 0xDFFFF),
+                    (0xEFFFE, 0xEFFFF), (0xFFFFE, 0xFFFFF),
+                    (0x10FFFE, 0x10FFFF)]
 illegal_ranges = [r'{}-{}'.format(chr(low), chr(high)) for low, high in illegal_xml_chrs]
 _PATTERN_ILL_XML_CHR = re.compile(r'[{}]'.format(r''.join(illegal_ranges)))
 _REPL_ILL_XML_CHR = lambda x: r'\x{:02X}'.format(ord(x.group(0)))
@@ -119,9 +122,6 @@ def merge_xmls(xmls):
     # TODO
     pass
 
-def strip_invalid_xml_chars(text):
-    pass
-
 def capitalize(s):
     return s[0].upper() + s[1:]
 
@@ -131,7 +131,7 @@ class AutoConnector:
 
     template = '{}'
 
-    def __init__(self, timeout, loop, fail_message=None, retries=_CONNECT_RETRIES):
+    def __init__(self, timeout, fail_message=None, retries=_CONNECT_RETRIES, *, loop):
         self._timeout = timeout
         self.loop = loop
         self.retries = retries
@@ -139,13 +139,11 @@ class AutoConnector:
             self.template = fail_message + ': ' + self.template
 
     async def connect(self):
-        backoff = 0
         for tries in range(self.retries + 1):
             try:
                 return await asyncio.wait_for(self._open_connection(), self._timeout, loop=self.loop)
             except asyncio.TimeoutError:
-                await asyncio.sleep(backoff)
-                backoff = backoff ** 2 if backoff > 0 else 1
+                await asyncio.sleep(tries ** 2)
         message = self.template.format('connection timed out')
         raise ConnectTimeout(message)
 
@@ -155,7 +153,60 @@ class AutoConnector:
     async def _open_connection(self):
         raise NotImplementedError
 
-class Retry:
+class CountLatch:
+    """A CountLatch implementation.
 
-    def __init__(self, connect, read, ):
-        pass
+    A semaphore manages an internal counter which is incremented by each count() call
+    and decremented by each count_down() call. When wait() finds that the counter is
+    greater than zero, it blocks, waiting until some other thread calls count_down().
+
+    :param int value: initial value for the internal counter; it defaults to 1.
+        If the value given is less than 0, ValueError is raised.
+    """
+
+    def __init__(self, value=0, *, loop=None):
+        if value < 0:
+            raise ValueError("initial value must be 0 or greater")
+        self._value = value
+        self._waiters = collections.deque()
+        self._loop = loop if loop else events.get_event_loop()
+
+    def locked(self):
+        """Returns True if semaphore can not be acquired immediately."""
+        return self._value > 0
+
+    def count(self, num=1):
+        """Increase a count."""
+        if num <= 0:
+            raise ValueError("cannot acquire {} counts".format(num))
+        self._value += num
+
+    def count_down(self, num=1):
+        """Decrease a count, incrementing the internal counter by one.
+        When it was greater than zero on entry and other coroutines are waiting for
+        it to become smaller than or equal to zero again, wake up those coroutines.
+        """
+        if num <= 0:
+            raise ValueError("cannot release {} counts".format(num))
+        self._value -= num
+
+        released = False
+        if self._value <= 0:
+            for waiter in self._waiters:
+                if not waiter.done():
+                    waiter.set_result(True)
+                    released = True
+        return released
+
+    async def wait(self):
+        """Wait until the internal counter is not larger than zero."""
+        if self._value <= 0:
+            return True
+
+        fut = futures.Future(loop=self._loop)
+        self._waiters.append(fut)
+        try:
+            await fut
+            return True
+        finally:
+            self._waiters.remove(fut)
