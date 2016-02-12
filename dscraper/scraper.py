@@ -1,15 +1,15 @@
-__all__ = ('Scraper', )
-
 import logging
 import asyncio
 from collections import deque
 from datetime import datetime
 from pytz import timezone
+from collections import defaultdict
 
 from .fetcher import Fetcher
 from .exporter import FileExporter
-from .exceptions import (InvalidCid, DscraperError, Watcher)
-from .utils import parse_xml, parse_json, merge_xmls, cid_filter, rec_cid_filter
+from .exceptions import (InvalidCid, DscraperError, Scavenger)
+from .utils import parse_comments_xml, parse_rolldate_json, merge_xmls
+from .company import CIDCompany, AIDCompany, CID, AID
 
 _logger = logging.getLogger(__name__)
 
@@ -33,181 +33,207 @@ _logger = logging.getLogger(__name__)
 
 
 class Scraper:
+    """The main class of dcraper.
 
-    def __init__(self, *, exporter=None, history=True, loop=None, workers=6): # TODO workers = 3?
-        # Validate arguments
-        if not loop:
-            loop = asyncio.get_event_loop()
-        if exporter is None:
-            exporter = FileExporter(loop=loop)
-        if workers <= 0:
-            raise ValueError('not a valid number')
+    Controls the operation and communication among other modules.
+    :TODO: add user interface during running using the curses library
+    """
+    MAX_WORKERS = 24
 
-        watcher = Watcher()
-        self.workers = [Worker(cid_iter=cid_iter, exporter=self.exporter,
-                               watcher=watcher, loop=loop, history=history)
-                        for _ in range(self.workers)]
-        watcher.register(self.workers)
+    def __init__(self, exporter=None, history=True, max_workers=6, *, loop=None): # TODO max_workers = 3?
+        if not 0 < max_workers <= self.MAX_WORKERS:
+            raise ValueError('number of workers is not in range [1, {}]'.format(self.MAX_WORKERS))
+        self.loop = loop or asyncio.get_event_loop()
+        self.exporter = exporter or FileExporter(loop=self.loop)
+        self.history = history
+        self.scavenger = Scavenger()
+        self.workers = max_workers
+        self._iters = defaultdict(list)
 
-    def scrape_range(self, start, end):
+    def add(self, target, company_type=CID):
+        """
+        :param int target:
+        """
+        self.add_list([target], company_type)
+
+    def add_range(self, start, end, company_type=CID):
+        """Adds a range of targets, inclusive.
+        :param int start:
+        :param int end:
+        """
         if start <= 0 or end < start:
             raise ValueError('not a valid range: [{} - {}]'.format(start, end))
-        self._scrape(range(start, end + 1))
+        self.add_list(range(start, end + 1), company_type)
 
-    def scrape_list(self, cids):
+    def add_list(self, targets, company_type=CID):
         """
-        Parameter:
-            cids: an iterable of integers
+        :param iterable targets: an iterable of integers
         """
-        self._scrape(cid_filter(cids))
+        try:
+            target_iter = iter(targets)
+        except TypeError as e:
+            raise TypeError('target not iterable') from e
+        self._iters[company_type].append(target_iter)
 
-    def scrape_mixed(self, cids):
-        """
-        Parameter:
-            cids: an iterable of integers and/or of iterables of integers
-        """
-        self._scrape(rec_cid_filter(cids))
+    def run(self):
+        scavenger = Scavenger()
+        distributor = None
+        exporter = self.exporter
+        workers = self.workers
+        companies = []
 
-    def _scrape(self, args):
+        # TODO Build the AIDCompany
+        # aid_targets = self._iters[AID]
+        # if aid_targets:
+        #     distributor = Distributor(self.loop)
+        #     distributor.set()
+        #     company = AIDCompany() # TODO
+        #     distributor = company
+        #     aid_workers = min(round(workers / 3), 1)
+        #     workers -= aid_workers
+        #     companies.append(company)
+        #     for target in self._iters[AID]:
+        #         company.post(target)
+
+        # Build the CIDCompany
+        if distributor is None:
+            # If there is no AIDCompany upstream, set the default distributor
+            distributor = Distributor(self.loop)
+            distributor.set()
+        company = CIDCompany(distributor, history=self.history,
+                             scavenger=scavenger, exporter=exporter,
+                             loop=self.loop, num_workers=workers)
+        companies.append(company)
+        for target in self._iters[CID]:
+            company.post(target)
+
+        self.loop.run_until_complete(self.exporter.connect())
+        asyncio.ensure_future(self._patrol())
+        results = self.loop.run_until_complete(asyncio.gather(*[com.run() for com in companies]))
+        self.loop.run_until_complete(self.exporter.disconnect())
+
+        # TODO sum up the results
+
+
+    async def _patrol():
+        # TODO read from the command line and update states. stop the scraper by calling distributor.close
         pass
-        # start working
-        # try:
-            # TODO
-            # # self.loop.run_until_complete(gather(workers.scrape_all()))
-            # await gather
-        # except :
-            # raise
 
-    # def _start(self):
-    #     self.exporter.open()
+class BaseWorker:
 
-    # def _end():
-    #     self.exporter.close()
-    #     pass
-
-
-class Worker:
-
-    def __init__(self, cid_iter, exporter, watcher, distributor, loop, history):
-        self.targets = cid_iter
+    def __init__(self, *, exporter, distributor, scavenger, fetcher):
         self.exporter = exporter
-        self.fetcher = Fetcher(loop=loop)
-        self.watcher = watcher
-        self.history = history
         self.distributor = distributor
+        self.scavenger = scavenger
+        self.fetcher = fetcher
+        self._stopped = False
 
-    async def scrape_all(self):
+    async def run(self):
         async with self.fetcher:
-            while not self.watcher.is_dead():
+            while not self._stopped and not self.scavenger.is_dead():
                 # TODO update progress, already scraped, current scraping
                 try:
-                    self.cid = await self.distributor.claim()
-                    await self._scrape_next()
+                    first, second = await self.distributor.claim()
+                    data = await self._next(first)
+                    await self.exporter.dump(first, second, **data)
                 except StopIteration:
                     break
                 except DscraperError as e:
-                    self.watcher.damage(e, self)
+                    self.scavenger.failure(self, e)
                 except:
-                    self.watcher.unexpected_damage(self)
+                    self.scavenger.failure(self, None)
                 else:
-                    self.watcher.heal()
-                # TODO relax according to polite time
+                    self.scavenger.success()
 
-        # TODO sum up the result, report
-        if self.watcher.is_dead():
-            _logger.critical('Worker is down due to too many expections!')
-        else:
-            pass
+    def stop(self):
+        self._stopped = True
 
-    async def _scrape_next(self):
+    async def _next(item):
+        raise NotImplementedError
+
+class CommentWorker(BaseWorker):
+
+    def __init__(self, *, distributor, scavenger, fetcher, exporter, history):
+        super().__init__(distributor=distributor, scavenger=scavenger, fetcher=fetcher, exporter=exporter)
+        self.history = history
+
+    async def _next(self, item):
         # Get the data
-        text = await self.fetcher.fetch_comments(self.cid)
+        root = parse_comments_xml(await self.fetcher.get_comments(item))
         # Get the history data
+        roll_date = None
         if self.history:
-            root = parse_xml(text)
-            # Continue only if the latest data contains comments no less than it could contain at maximum
-            # Notice: the elements in XML are not always sorted by tags, for example /12.xml
-            elimit = root.find('maxlimit')
-            if elimit:
-                limit = int(elimit.text)
+            # Continue only if the latest data contains comments no less than it could at maximum
+            # note: the elements in XML are not always sorted by tags, for example /12.xml
+            limit = root.find('maxlimit')
+            try:
+                limit = int(limit.text)
+            except (TypeError, ValueError):
+                pass
+            else:
                 num_comments = len(root.findall('d') or [])
                 if num_comments >= limit:
-                    await self._scrape_history(root)
-        # Export all data scraped in this round
-        merge_xmls()
-        await self.exporter.dump(self.cid, root, )
+                    roll_date = parse_rolldate_json(await self.fetcher.get_rolldate(self.cid))
+                    await self._history(root, roll_date)
+        return {'data': root,
+                'splitter': roll_date}
 
-    async def _scrape_history(self, root):
-        # TODO
-        roll_dates = parse_json(await self.fetcher.fetch_rolldate(self.cid))
+    async def _history(self, root, roll_date):
+        """Scrapes all history comments on the Roll Date using minimum requests, and appends
+        the result to the root XML object in sorted order.
+        Does not scrape all history files from the Roll Date unless some normal comments
+        in one of the files are not sorted by their timestamps, which is the fundamental
+        assumpution of the algorithm implemented here to reduce requests.
+
+        :param XML root:
+        :param JSON roll_date:
+        """
         pass
 
 class Distributor:
-    """Distribute items on demand. Support frequency control and time zone.
-
-    :param tuple time_config: (tzinfo of the time zone where the host is,
-                               duration of pause when scraping in rush hours,
-                               start of the rush hours,
-                               end of the rush hours)
+    """Distributes items from lists on demand. Support blocking when there is
+    no items available.
     """
+    def __init__(self, *, loop):
+        self._queue = deque()
+        self._iter = None
+        self._latch = Sluice(loop=loop)
+        self.set = self._latch.set
+        self.is_set = self._latch.is_set
 
-    def __init__(self, loop=None, time_config=BILIBILI_TIME_CONFIG):
-        self.queue = deque()
-        self.loop = loop or asyncio.get_event_loop()
-        self.lock = asyncio.Lock(self.loop)
-        self.tz, self.interval_busy, start, end = time_config
-        if start > 23 or end < 0:
-            raise ValueError('hour must be in [0, 23]')
-        try:
-            self.rush_hours = set(hour for hour in range(start, 24)) | set(hour for hour in range(0, end + 1))
-        except TypeError as e:
-            raise TypeError('hour must be integer') from e
-        self.interval = 0
-
-    def post(self, cid_iter):
-        self.queue.append((cid for cid in cid_iter))
-
-    def post_rec(self, cid_iters):
-        # The depth of recursion is only 2 though
-        def _rec_cid_iter():
-            for cid_iter in cid_iters:
-                try:
-                    for cid in cid_iter:
-                        yield cid
-                except TypeError:
-                    yield cid_iter
-        self.post(_rec_cid_iter())
-
-    def update_interval(self):
-        hour_now = datetime.datetime.now(tz=self.tz).hour
-        self.interval = self.interval_busy if hour_now in self.rush_hours else 0
+    def post(self, it):
+        """
+        :param iterator it:
+        """
+        if self.is_set():
+            raise RuntimeError('distributor does not accept items anymore')
+        # TODO priority post
+        self._queue.append(it)
+        self._latch.leak()
 
     async def claim(self):
-        # Poll an item anyway
-        while True:
-            if not self.iter:
-                if self.queue:
-                    self.iter = self.queue.popleft()
-                else:
-                    raise StopIteration('no items available')
-            try:
-                cid = next(self.iter)
-            except StopIteration:
-                self.iter = None
-            else:
-                break
-        # Validate the item
-        try:
-            cid = int(cid)
-        except TypeError:
-            raise InvalidCid('Invalid cid from input: an integer is required, not \'{}\''.format(type(cid).__name__))
-        if cid <= 0:
-            raise InvalidCid('Invalid cid from input: a positive integer is required')
-        # Frequency control
-        self.update_interval()
-        if self.interval > 0:
-            await self.lock.acquire()
-            self.loop.call_later(self.interval, self.lock.release)
-        return cid
+        """Polls an item.
 
-BILIBILI_TIME_CONFIG = (pytz.timezone('Asia/Shanghai'), 1, 7, 10)
+        When there is no item available, block until there is. If this distributor
+        is set and there is no item, raise StopIteration instead.
+        """
+        while True:
+            if not self._iter:
+                if self._queue:
+                    self._iter = self._queue.popleft()
+                elif self.is_set():
+                    raise StopIteration('no items available')
+                else:
+                    # Wait until there are new items or this distributor is closed
+                    await self._latch.wait()
+                    continue
+            try:
+                return next(self._iter)
+            except StopIteration:
+                self._iter = None
+
+    def close(self):
+        """Close this distributor."""
+        self._queue.clear()
+        self._iter = None
+        self.set()
