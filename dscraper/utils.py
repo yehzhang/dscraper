@@ -1,5 +1,5 @@
 from functools import update_wrapper
-import collections
+from collections import deque
 import warnings
 import asyncio
 import re
@@ -168,7 +168,7 @@ class CountLatch:
         if value < 0:
             raise ValueError("initial value must be 0 or greater")
         self._value = value
-        self._waiters = collections.deque()
+        self._waiters = deque()
         self._loop = loop if loop else events.get_event_loop()
 
     def locked(self):
@@ -178,7 +178,7 @@ class CountLatch:
     def count(self, num=1):
         """Increase a count."""
         if num <= 0:
-            raise ValueError("cannot acquire {} counts".format(num))
+            raise ValueError('cannot increase \'{}\' counts'.format(num))
         self._value += num
 
     def count_down(self, num=1):
@@ -187,7 +187,7 @@ class CountLatch:
         it to become smaller than or equal to zero again, wake up those coroutines.
         """
         if num <= 0:
-            raise ValueError("cannot release {} counts".format(num))
+            raise ValueError('cannot decrease \'{}\' counts'.format(num))
         self._value -= num
 
         released = False
@@ -207,6 +207,61 @@ class CountLatch:
         self._waiters.append(fut)
         try:
             await fut
+            return True
+        finally:
+            self._waiters.remove(fut)
+
+class Sluice:
+    """
+    An Sluice manages a flag that can be set to true with the set() method and
+    reset to false with the clear() method. The wait() method blocks until the
+    flag is true or the leak() method is called. The flag is initially false.
+    """
+    def __init__(self, *, loop=None):
+        self._waiters = deque()
+        self._loop = loop or events.get_event_loop()
+        self._value = False
+
+    def leak(self):
+        """Awakes all coroutines waiting for it. Does not set the internal flag.
+        """
+        if not self._value:
+            for fut in self._waiters:
+                if not fut.done():
+                    fut.set_result(True)
+
+    def set(self):
+        """Set the internal flag to true. All coroutines waiting for it to
+        become true are awakened. Coroutine that call wait() once the flag is
+        true will not block at all.
+        """
+        self.leak()
+        self._value = True
+
+    def is_set(self):
+        """Return True if and only if the internal flag is true."""
+        return self._value
+
+    def clear(self):
+        """Reset the internal flag to false. Subsequently, coroutines calling
+        wait() will block until set() is called to set the internal flag
+        to true again or the leak() method is called."""
+        self._value = False
+
+    async def wait(self):
+        """Block until the internal flag is true.
+
+        If the internal flag is true on entry, return True immediately.
+        Otherwise, block until another coroutine calls set() to set the flag
+        to true or leak(), then return True.
+        """
+        if self._value:
+            return True
+
+        fut = futures.Future(loop=self._loop)
+        self._waiters.append(fut)
+        try:
+            yield from fut
             return True
         finally:
             self._waiters.remove(fut)
