@@ -19,10 +19,10 @@ class DscraperError(Exception):
     level = logging.INFO
 
     def __init__(self, message=None, logging_level=True):
-        if message:
-            super().__init__(message)
-        else:
+        if message is None:
             super().__init__()
+        else:
+            super().__init__(message)
         if logging_level is not True:
             self.level = logging_level
 
@@ -47,13 +47,9 @@ class ResponseError(HostError):
 class NoResponseReadError(ResponseError):
     """There is no response from the host.
     Basically it is caused by opening a 404 page, or keeping the host waiting too long,
-    so that the connection was closed. This exception occurs frequently."""
+    so that the connection was closed. This exception occurs frequently.
+    """
     damage = 10
-
-class PageNotFound(ResponseError):
-    """The given uri ended in a 404 page.
-    This exception is so common that we don't care at all."""
-    damage = 0
 
 class DataError(DscraperError, ValueError):
     """The data read from the response was invalid.
@@ -73,12 +69,11 @@ class ParseError(DataError):
 
 class ContentError(DataError):
     """The recieved XML data contains a single element with "error" as content."""
-    damage = 0
+    damage = 5
 
-class InvalidCid(DscraperError, ValueError, TypeError):
-    """The worker was fed with an invalid cid to work with."""
-    damage = 24
-    level = logging.WARNING
+class PageNotFound(DscraperError):
+    """The given uri ended in a 404 page, which is very likely to happen."""
+    damage = 5
 
 class MultipleErrors(DscraperError):
     """The container of multiple errors."""
@@ -94,43 +89,47 @@ class MultipleErrors(DscraperError):
 class Scavenger:
     """
     """
+    _MAX_HEALTH = 120
+    _REGEN_SPEED = 0.1
+    _UNEXPECTED_DAMAGE = 100
 
-    def __init__(self, log=True):
-        self.log = log
+    def __init__(self):
         self.dead = False
-        self.register([])
+        self.health = self._max_health = self._MAX_HEALTH
+        self.regen = self._max_health * self._REGEN_SPEED
+        self.recorders = None
 
-    def register(self, workers):
-        num_workers = max(len(workers), 1)
-        num_recorders = min(num_workers, 3)
-        shuffle(workers)
-        self.recorders = frozenset(workers[:num_recorders])
-        self.health = self._max_health = _MAX_HEALTH * num_recorders
-        self.regen = round(_MAX_HEALTH * _REGEN_SPEED * (num_recorders / num_workers))
+    def set_recorders_by(self, delta):
+        if self.recorders is None:
+            recorders = delta
+            self.recorders = 1
+        else:
+            recorders = self.recorders + delta
+        if recorders <= 0:
+            raise ValueError('cannot set \'{}\' recorders'.format(recorders))
 
-    def heal(self):
+        self.health = self.health / self.recorders * recorders
+        self._max_health = self._MAX_HEALTH * recorders
+        self.regen = self._max_health * self._REGEN_SPEED * recorders
+        self.recorders = recorders
+
+    def success(self):
         self.health = min(self.health + self.regen, self._max_health)
 
-    def damage(self, e, worker):
-        if self.log:
+    def failure(self, worker, e):
+        # TODO log worker type
+        if e is None:
+            _logger.expection('Unexpected exception occured when scraping cid %d', worker.cid)
+            self.health -= self._UNEXPECTED_DAMAGE
+        else:
             message = '{} at cid {}'.format(capitalize(e.args[0]), worker.cid)
             if e.__cause__:
                 message += ': ' + e.__cause__
             _logger.log(e.level, message)
-        if worker in self.recorders:
             self.health -= e.damage
-            if self.health <= 0:
-                self.dead = True
-
-    def unexpected_damage(self, worker):
-        _logger.expection('Unexpected exception occured when scraping cid %d', worker.cid)
-        self.health -= _UNEXPECTED_DAMAGE
         if self.health <= 0:
             self.dead = True
 
     def is_dead(self):
         return self.dead
 
-_MAX_HEALTH = 120
-_REGEN_SPEED = 0.1
-_UNEXPECTED_DAMAGE = 100

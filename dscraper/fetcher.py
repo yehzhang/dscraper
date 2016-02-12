@@ -1,6 +1,7 @@
 import logging
 import asyncio
 import re
+from collections import defaultdict
 
 from .utils import alock, AutoConnector, get_headers_text, get_status_code, inflate_and_decode, strip_invalid_xml_chars
 from .exceptions import HostError, ConnectTimeout, ResponseError, DecodeError, MultipleErrors, NoResponseReadError, PageNotFound
@@ -28,32 +29,25 @@ class BaseFetcher:
         'Connection': 'keep-alive'
     }
 
+    controllers = defaultdict(FrequencyController)
+
     def __init__(self, host, port=_PORT, *, loop):
         if not headers:
             headers = dict(self._DEFAULT_HEADERS)
         headers['Host'] = host
-        self.session = Session(host, port, headers, loop=loop)
-        self._set_controller(loop)
-
-    @classmethod
-    def _set_controller(cls, *, loop):
-        self._controller = FrequencyController(loop=loop)
-
-    def _set_header(self, headers):
-        self.session.set_header(headers)
+        self._controller = self.controllers[host]
+        self._session = Session(host, port, headers, loop=loop)
+        # Export the methods
+        self.open = self._session.connect
+        self.close = self._session.disconnect
+        self._set_headers = self._session.set_headers
 
     async def __aenter__(self):
-        await self.session.connect()
+        await self.open()
         return self
 
     async def __aexit__(self, exc_type, exc, tb):
-        await self.session.disconnect()
-
-    async def open(self):
-        await self.session.connect()
-
-    async def close(self):
-        await self.session.disconnect()
+        await self.close()
 
     async def get(self, uri):
         """Fetch the content.
@@ -63,18 +57,19 @@ class BaseFetcher:
         :param string uri: the URI to fetch content from
         :raise: HostError, DecodeError, PageNotFound
         """
+        await self._controller.wait()
         # try to get the response
         try:
-            return await self.session.get(uri)
+            return await self._session.get(uri)
         except (ConnectTimeout, MultipleErrors) as e:
             raise HostError('failed to read from the host') from e
         except AttributeError as e:
             raise RuntimeError('fetcher is not opened yet') from e
 
-class CommentFetcher(BaseFetcher):
+class CIDFetcher(BaseFetcher):
 
-    def __init__(self):
-        super().__init__(_HOST_CID)
+    def __init__(self, *, loop):
+        super().__init__(_HOST_CID, loop=loop)
 
     async def get_comments(self, cid, timestamp=0):
         if timestamp == 0:
@@ -88,10 +83,10 @@ class CommentFetcher(BaseFetcher):
         uri = '/rolldate,{}'.format(cid)
         return await self.get(uri)
 
-class MetaFetcher(BaseFetcher):
+class MetaCIDFetcher(BaseFetcher):
 
-    def __init__(self):
-        super().__init__(_HOST_AID)
+    def __init__(self, *, loop):
+        super().__init__(_HOST_AID, loop=loop)
 
     async def get_cid(self, aid):
         """Get the Chat ID of the given AV ID. Alternatively uses the APIs
@@ -130,7 +125,7 @@ class Session(AutoConnector):
         self.set_headers(headers)
         self._reader = self._writer = None
 
-    def set_header(self, headers):
+    def set_headers(self, headers):
         self._template = self._REQUEST_TEMPLATE.format(headers=get_headers_text(headers))
 
     async def get(self, uri):
@@ -242,8 +237,8 @@ class FrequencyController:
         int end: ending of the rush hour
         tzinfo timezone: time zone where the host is
     """
-    def __init__(self, time_config=_BILIBILI_TIME_CONFIG, *, loop):
-        self.loop = loop
+    def __init__(self, time_config=_BILIBILI_TIME_CONFIG, *, loop=None):
+        self.loop = loop or asyncio.get_event_loop()
         self.interval, self.busy_interval, start, end, self.tz = time_config
         if start > 23 or end < 0:
             raise ValueError('hour must be in [0, 23]')
@@ -251,26 +246,27 @@ class FrequencyController:
             self.rush_hours = set(hour for hour in range(start, 24)) | set(hour for hour in range(0, end + 1))
         except TypeError as e:
             raise TypeError('hour must be integer') from e
-        self._semaphore = asyncio.Semaphore(loop=loop)
+        self._latch = asyncio.Semaphore(loop=loop)
         self._blocking = True
 
     async def wait(self):
         """Controls frequency."""
         if self_.blocking:
-            await self._semaphore.acquire()
             # Check if frequency control is required
             hour = datetime.datetime.now(tz=self.tz).hour
-            self.loop.call_later(self.busy_interval if hour in self.rush_hours else self.interval,
-                                 self._semaphore.release)
+            interval = self.busy_interval if hour in self.rush_hours else self.interval
+            if interval:
+                await self._latch.acquire()
+                self.loop.call_later(interval, self._latch.release)
 
     def free(self):
         """Stop blocking coroutines."""
         if self._blocking:
-            self._semaphore.release()
+            self._latch.release()
             self._blocking = False
 
     def shut(self):
         """Start blocking coroutines."""
         if not self._blocking:
-            self.loop.run_until_complete(self._semaphore.acquire())
+            self.loop.run_until_complete(self._latch.acquire())
             self._blocking = True
