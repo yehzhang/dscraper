@@ -3,11 +3,12 @@ import asyncio
 import re
 from collections import defaultdict
 
-from .utils import alock, AutoConnector, get_headers_text, get_status_code, inflate_and_decode, strip_invalid_xml_chars
-from .exceptions import HostError, ConnectTimeout, ResponseError, DecodeError, MultipleErrors, NoResponseReadError, PageNotFound
-from . import __version__
+from .utils import FrequencyController, NullController, AutoConnector, get_headers_text, get_status_code, inflate_and_decode, strip_invalid_xml_chars
+from .exceptions import HostError, ConnectTimeout, ResponseError, MultipleErrors, NoResponseReadError, PageNotFound
+from . import __version__, _DEBUGGING
 
 _logger = logging.getLogger(__name__)
+
 
 _HOST_CID = 'comment.bilibili.com'
 _HOST_AID = 'bilibili.com'
@@ -31,11 +32,11 @@ class BaseFetcher:
 
     controllers = defaultdict(FrequencyController)
 
-    def __init__(self, host, port=_PORT, *, loop):
+    def __init__(self, host, port=_PORT, headers=None, *, loop):
         if not headers:
             headers = dict(self._DEFAULT_HEADERS)
         headers['Host'] = host
-        self._controller = self.controllers[host]
+        self._controller = self.controllers[host] if not _DEBUGGING else NullController()
         self._session = Session(host, port, headers, loop=loop)
         # Export the methods
         self.open = self._session.connect
@@ -113,7 +114,9 @@ class Session(AutoConnector):
     _REQUEST_TEMPLATE = 'GET {{uri}} HTTP/1.1\r\n{headers}\r\n'
     _READ_RETRIES = 2
     _PATTERN_TE = re.compile(b'Transfer-Encoding: chunked\r\n')
-    _PATTERN_CL = re.compile(b'Content-Length: (\d+)\r\n')
+    _PATTERN_CL = re.compile(b'Content-Length: (\\d+)\r\n')
+    _PATTERN_TE_BEGIN = re.compile(b'^([0-9A-Fa-f]+)\r\n')
+    _PATTERN_TE_END = re.compile(b'\r\n([0-9A-Fa-f]+)(?:\r\n)+$')
     _LINE_BREAK = b'\r\n'
     _DOUBLE_BREAK = b'\r\n\r\n'
 
@@ -178,6 +181,8 @@ class Session(AutoConnector):
 
     async def _read(self):
         response = b''
+        content_length = is_chunked = False
+
         while True:
             task = self._reader.read(16384)
             # Time out if the server has not issued a response for read_timeout seconds
@@ -188,28 +193,53 @@ class Session(AutoConnector):
             # Which means the response contains no end-of-response information
             if not chunk:
                 break
-            # Check if the response contains the 'Transfer-Encoding: chunked' header
-            match = self._PATTERN_TE.search(response)
-            if match:
+
+            if is_chunked:
+                # Following chunks contain length at the beginning normally
                 try:
-                    length, content = chunk.split(self._LINE_BREAK, 1)
-                except ValueError:
-                    pass
-                else:
-                    if int(length) <= 0:
+                    _, length, content = self._PATTERN_TE_BEGIN.split(chunk, 1)
+                    length = int(length, 16)
+                    if length == 0:
                         break
-                    response += content.rstrip(self._LINE_BREAK)
+                    response += content
+                except ValueError:
+                    # Except that the second chunk, which is supposed to be integral
+                    # to the first one, may contain length 0 at the end
+                    try:
+                        content, length, _ = self._PATTERN_TE_END.split(chunk, 1)
+                        length = int(length, 16)
+                    except ValueError as e:
+                        raise ResponseError('response from the host was invalid') from e
+                    response += content
+                    if length == 0:
+                        break
+
+            # Check if the response contains the 'Transfer-Encoding: chunked' header
+            elif content_length is False and self._PATTERN_TE.search(chunk):
+                is_chunked = True
+                chunk = chunk.rstrip(self._LINE_BREAK)
+                # The first chunk contains length 0 at the end
+                try:
+                    content, length, _ = self._PATTERN_TE_END.split(chunk, 1)
+                    length = int(length, 16)
+                    response += content
+                    if length == 0:
+                        break
+                except ValueError as e:
+                    # Or no length, usually
+                    response += chunk
+
+            # Check if the response contains the 'Content-Length' header
             else:
                 response += chunk
-                # Check if the response contains the 'Content-Length' header
-                try:
-                    headers, body = response.split(self._DOUBLE_BREAK, 1)
-                except ValueError:
-                    pass
-                else:
-                    match = self._PATTERN_CL.search(headers)
-                    if match:
-                        content_length = int(match.group(1))
+                match = self._PATTERN_CL.search(response)
+                if match:
+                    content_length = int(match.group(1))
+                    try:
+                        headers, body = response.split(self._DOUBLE_BREAK, 1)
+                    except ValueError:
+                        pass
+                    else:
                         if len(body) == content_length:
                             break
         return response
@@ -223,50 +253,3 @@ class Session(AutoConnector):
     async def disconnect(self):
         self._writer.close()
         self._reader = self._writer = None
-
-_BILIBILI_TIME_CONFIG = (0, 1, 7, 10, timezone('Asia/Shanghai'))
-
-class FrequencyController:
-    """
-    Limits the frequency of coroutines running across.
-
-    :param tuple time_config: a 5-tuple of the configuration of the controller's behavior
-        number interval: duration of waiting in common hours
-        number busy_interval: duration of waiting in rush hours
-        int start: beginning of the rush hour
-        int end: ending of the rush hour
-        tzinfo timezone: time zone where the host is
-    """
-    def __init__(self, time_config=_BILIBILI_TIME_CONFIG, *, loop=None):
-        self.loop = loop or asyncio.get_event_loop()
-        self.interval, self.busy_interval, start, end, self.tz = time_config
-        if start > 23 or end < 0:
-            raise ValueError('hour must be in [0, 23]')
-        try:
-            self.rush_hours = set(hour for hour in range(start, 24)) | set(hour for hour in range(0, end + 1))
-        except TypeError as e:
-            raise TypeError('hour must be integer') from e
-        self._latch = asyncio.Semaphore(loop=loop)
-        self._blocking = True
-
-    async def wait(self):
-        """Controls frequency."""
-        if self_.blocking:
-            # Check if frequency control is required
-            hour = datetime.datetime.now(tz=self.tz).hour
-            interval = self.busy_interval if hour in self.rush_hours else self.interval
-            if interval:
-                await self._latch.acquire()
-                self.loop.call_later(interval, self._latch.release)
-
-    def free(self):
-        """Stop blocking coroutines."""
-        if self._blocking:
-            self._latch.release()
-            self._blocking = False
-
-    def shut(self):
-        """Start blocking coroutines."""
-        if not self._blocking:
-            self.loop.run_until_complete(self._latch.acquire())
-            self._blocking = True

@@ -1,12 +1,8 @@
-__all__ = ('DscraperError', 'HostError', 'ConnectTimeout',
-           'ResponseError', 'DataError', 'DecodeError', 'ParseError',
-           'InvalidCid', 'MultipleErrors', 'NoResponseReadError', 'PageNotFound')
+# __all__ = ('DscraperError', 'HostError', 'ConnectTimeout',
+#            'ResponseError', 'DataError', 'DecodeError', 'ParseError',
+#            'InvalidCid', 'MultipleErrors', 'NoResponseReadError', 'PageNotFound')
 
-from traceback import format_exception
-from random import shuffle
 import logging
-
-from .utils import capitalize
 
 _logger = logging.getLogger(__name__)
 
@@ -119,10 +115,10 @@ class Scavenger:
     def failure(self, worker, e):
         # TODO log worker type
         if e is None:
-            _logger.expection('Unexpected exception occured when scraping cid %d', worker.cid)
+            _logger.exception('Unexpected exception occured when scraping cid %d', worker.cid)
             self.health -= self._UNEXPECTED_DAMAGE
         else:
-            message = '{} at cid {}'.format(capitalize(e.args[0]), worker.cid)
+            message = '{} at cid {}'.format(self.capitalize(e.args[0]), worker.cid)
             if e.__cause__:
                 message += ': ' + e.__cause__
             _logger.log(e.level, message)
@@ -132,4 +128,8 @@ class Scavenger:
 
     def is_dead(self):
         return self.dead
+
+    @staticmethod
+    def capitalize(s):
+        return s[0].upper() + s[1:]
 

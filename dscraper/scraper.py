@@ -1,14 +1,11 @@
 import logging
 import asyncio
 from collections import deque
-from datetime import datetime
-from pytz import timezone
 from collections import defaultdict
 
-from .fetcher import Fetcher
 from .exporter import FileExporter
-from .exceptions import (InvalidCid, DscraperError, Scavenger)
-from .utils import parse_comments_xml, parse_rolldate_json, merge_xmls
+from .exceptions import Scavenger
+from .utils import Sluice
 from .company import CIDCompany, AIDCompany, CID, AID
 
 _logger = logging.getLogger(__name__)
@@ -98,14 +95,15 @@ class Scraper:
         # Build the CIDCompany
         if distributor is None:
             # If there is no AIDCompany upstream, set the default distributor
-            distributor = Distributor(self.loop)
+            distributor = Distributor(loop=self.loop)
             distributor.set()
         company = CIDCompany(distributor, history=self.history,
                              scavenger=scavenger, exporter=exporter,
-                             loop=self.loop, num_workers=workers)
-        companies.append(company)
+                             loop=self.loop)
+        company.hire(workers)
         for target in self._iters[CID]:
             company.post(target)
+        companies.append(company)
 
         self.loop.run_until_complete(self.exporter.connect())
         asyncio.ensure_future(self._patrol())
@@ -115,79 +113,8 @@ class Scraper:
         # TODO sum up the results
 
 
-    async def _patrol():
+    async def _patrol(self):
         # TODO read from the command line and update states. stop the scraper by calling distributor.close
-        pass
-
-class BaseWorker:
-
-    def __init__(self, *, exporter, distributor, scavenger, fetcher):
-        self.exporter = exporter
-        self.distributor = distributor
-        self.scavenger = scavenger
-        self.fetcher = fetcher
-        self._stopped = False
-
-    async def run(self):
-        async with self.fetcher:
-            while not self._stopped and not self.scavenger.is_dead():
-                # TODO update progress, already scraped, current scraping
-                try:
-                    first, second = await self.distributor.claim()
-                    data = await self._next(first)
-                    await self.exporter.dump(first, second, **data)
-                except StopIteration:
-                    break
-                except DscraperError as e:
-                    self.scavenger.failure(self, e)
-                except:
-                    self.scavenger.failure(self, None)
-                else:
-                    self.scavenger.success()
-
-    def stop(self):
-        self._stopped = True
-
-    async def _next(item):
-        raise NotImplementedError
-
-class CommentWorker(BaseWorker):
-
-    def __init__(self, *, distributor, scavenger, fetcher, exporter, history):
-        super().__init__(distributor=distributor, scavenger=scavenger, fetcher=fetcher, exporter=exporter)
-        self.history = history
-
-    async def _next(self, item):
-        # Get the data
-        root = parse_comments_xml(await self.fetcher.get_comments(item))
-        # Get the history data
-        roll_date = None
-        if self.history:
-            # Continue only if the latest data contains comments no less than it could at maximum
-            # note: the elements in XML are not always sorted by tags, for example /12.xml
-            limit = root.find('maxlimit')
-            try:
-                limit = int(limit.text)
-            except (TypeError, ValueError):
-                pass
-            else:
-                num_comments = len(root.findall('d') or [])
-                if num_comments >= limit:
-                    roll_date = parse_rolldate_json(await self.fetcher.get_rolldate(self.cid))
-                    await self._history(root, roll_date)
-        return {'data': root,
-                'splitter': roll_date}
-
-    async def _history(self, root, roll_date):
-        """Scrapes all history comments on the Roll Date using minimum requests, and appends
-        the result to the root XML object in sorted order.
-        Does not scrape all history files from the Roll Date unless some normal comments
-        in one of the files are not sorted by their timestamps, which is the fundamental
-        assumpution of the algorithm implemented here to reduce requests.
-
-        :param XML root:
-        :param JSON roll_date:
-        """
         pass
 
 class Distributor:

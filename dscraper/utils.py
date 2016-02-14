@@ -1,6 +1,7 @@
 from functools import update_wrapper
 from collections import deque
-import warnings
+from pytz import timezone
+from datetime import datetime
 import asyncio
 import re
 import xml.etree.ElementTree as et
@@ -8,7 +9,7 @@ import json
 import zlib
 import logging
 
-from .exceptions import ConnectTimeout, MultipleErrors, ParseError
+from .exceptions import ParseError, DecodeError, ContentError, ConnectTimeout
 
 _logger = logging.getLogger(__name__)
 
@@ -25,30 +26,30 @@ def trace(f):
 
         sa = ', '.join(map(repr, args))
         skwa = ', '.join('{}={}'.format(k, repr(v)) for k, v in kwargs.items())
-        sig = signature.format(name=f.__name__,
+        sig = SIGNATURE.format(name=f.__name__,
                                args=sa + ', ' + skwa if sa and skwa else sa + skwa)
-        sin = format_in.format(indent=indent * trace._depth, tid=tid, signature=sig)
+        sin = FORMAT_IN.format(indent=INDENT * trace._depth, tid=tid, signature=sig)
         print(sin)
 
         trace._depth += 1
         try:
             result = f(*args, **kwargs)
-            sout = format_out.format(indent=indent * (trace._depth - 1), tid=tid,
+            sout = FORMAT_OUT.format(indent=INDENT * (trace._depth - 1), tid=tid,
                                      result=repr(result))
             print(sout)
             return result
         finally:
             trace._depth -= 1
 
-    trace._traced = 0
-    trace._depth = 0
-
     return _f
 
-signature = '{name}({args})'
-indent = '   '
-format_in = '{indent}{signature} -> #{tid}'
-format_out = '{indent}{result} <- #{tid}'
+trace._traced = 0
+trace._depth = 0
+
+SIGNATURE = '{name}({args})'
+INDENT = '   '
+FORMAT_IN = '{indent}{signature} -> #{tid}'
+FORMAT_OUT = '{indent}{result} <- #{tid}'
 
 @decorator
 def alock(coro):
@@ -69,7 +70,7 @@ def get_status_code(raw):
     except TypeError:
         pass
 
-_PATTERN_ST = re.compile(b'HTTP/1.1 (\d+) ')
+_PATTERN_ST = re.compile(b'HTTP/1.1 (\\d+) ')
 
 def inflate_and_decode(raw):
     dobj = zlib.decompressobj(-zlib.MAX_WBITS)
@@ -88,7 +89,6 @@ def parse_comments_xml(text):
         raise ParseError('failed to parse the XML data') from e
     if root.text == 'error':
         raise ContentError('the XML data contains a single element with "error" as content')
-    # TODO split attrs
     return root
 
 def strip_invalid_xml_chars(text):
@@ -112,18 +112,47 @@ _PATTERN_ILL_XML_CHR = re.compile(r'[{}]'.format(r''.join(illegal_ranges)))
 _REPL_ILL_XML_CHR = lambda x: r'\x{:02X}'.format(ord(x.group(0)))
 del illegal_xml_chrs, illegal_ranges
 
+def deserialize_comment_attributes(root):
+    for d in root.iterfind('d'):
+        sattr = d.attrib.get('p')
+        offset, mode, font_size, color, date, pool_id, user_id, comment_id = sattr.split(',')
+        offset = float(offset)
+        if offset % 1 == 0:
+            offset = int(offset)
+        d.attrib = {
+            'offset': offset,
+            'mode': int(mode),
+            'font_size': int(font_size),
+            'color': int(color),
+            'date': int(date),
+            'pool_id': int(pool_id),
+            'user_id': user_id,
+            'comment_id': int(comment_id)
+        }
+
+def serialize_comment_attributes(root):
+    for d in root.iterfind('d'):
+        sattr = ','.join(map(lambda x: str(d.attrib[x]), SATTRIBUTE))
+        d.attrib = {'p': sattr}
+
+SATTRIBUTE = ('offset', 'mode', 'font_size', 'color', 'date', 'pool_id', 'user_id', 'comment_id')
+
 def parse_rolldate_json(text):
     try:
         return json.loads(text)
     except json.JSONDecodeError as e:
         raise ParseError('failed to parse the JSON data') from e
 
+def split_xml(xml, splitter):
+    if splitter is None:
+        return xml
+    # TODO get maxlimit and form the current xml, then form history xmls.
+    # remember to attach headers to all files
+    pass
+
 def merge_xmls(xmls):
     # TODO
     pass
-
-def capitalize(s):
-    return s[0].upper() + s[1:]
 
 _CONNECT_RETRIES = 2
 
@@ -169,7 +198,7 @@ class CountLatch:
             raise ValueError("initial value must be 0 or greater")
         self._value = value
         self._waiters = deque()
-        self._loop = loop if loop else events.get_event_loop()
+        self._loop = loop if loop else asyncio.get_event_loop()
 
     def locked(self):
         """Returns True if semaphore can not be acquired immediately."""
@@ -198,12 +227,15 @@ class CountLatch:
                     released = True
         return released
 
+    def __len__(self):
+        return min(self._value, 0)
+
     async def wait(self):
         """Wait until the internal counter is not larger than zero."""
         if self._value <= 0:
             return True
 
-        fut = futures.Future(loop=self._loop)
+        fut = asyncio.Future(loop=self._loop)
         self._waiters.append(fut)
         try:
             await fut
@@ -219,7 +251,7 @@ class Sluice:
     """
     def __init__(self, *, loop=None):
         self._waiters = deque()
-        self._loop = loop or events.get_event_loop()
+        self._loop = loop or asyncio.get_event_loop()
         self._value = False
 
     def leak(self):
@@ -258,10 +290,71 @@ class Sluice:
         if self._value:
             return True
 
-        fut = futures.Future(loop=self._loop)
+        fut = asyncio.Future(loop=self._loop)
         self._waiters.append(fut)
         try:
-            yield from fut
+            await fut
             return True
         finally:
             self._waiters.remove(fut)
+
+TIME_CONFIG_CN = (0, 1, 18, 22, timezone('Asia/Shanghai'))
+
+class FrequencyController:
+    """
+    Limits the frequency of coroutines running across.
+
+    :param tuple time_config: a 5-tuple of the configuration of the controller's behavior
+        number interval: duration of waiting in common hours
+        number busy_interval: duration of waiting in rush hours
+        int start: beginning of the rush hour
+        int end: ending of the rush hour
+        tzinfo timezone: time zone where the host is
+    """
+    def __init__(self, time_config=TIME_CONFIG_CN, *, loop=None):
+        self.loop = loop or asyncio.get_event_loop()
+        self.interval, self.busy_interval, start, end, self.tz = time_config
+        if start > 23 or end < 0:
+            raise ValueError('hour must be in [0, 23]')
+        try:
+            if start < end:
+                self.rush_hours = set(range(start, end))
+            else:
+                self.rush_hours = set(range(start, 24)) | set(range(0, end + 1))
+        except TypeError as e:
+            raise TypeError('hour must be integer') from e
+        self._latch = asyncio.Semaphore(loop=loop)
+        self._blocking = True
+
+    async def wait(self):
+        """Controls frequency."""
+        if self._blocking:
+            hour = datetime.now(tz=self.tz).hour
+            interval = self.busy_interval if hour in self.rush_hours else self.interval
+            if interval > 0:
+                _logger.debug('Controller blocking')
+                await self._latch.acquire()
+                self.loop.call_later(interval, self._latch.release)
+                return True
+        return False
+
+    def free(self):
+        """Stop blocking coroutines."""
+        if self._blocking:
+            self._latch.release()
+            self._blocking = False
+
+    def shut(self):
+        """Start blocking coroutines."""
+        if not self._blocking:
+            self.loop.run_until_complete(self._latch.acquire())
+            self._blocking = True
+
+class NullController:
+
+    def __init__(self, *args, **kwargs):
+        pass
+
+    async def wait(self):
+        pass
+

@@ -14,6 +14,8 @@ __author__ = 'Simon Zhang'
 __license__ = 'Apache 2.0'
 __copyright__ = 'Copyright 2016 Simon Zhang'
 
+_DEBUGGING = False
+
 import sys
 assert sys.version_info >= (3, 5)
 
@@ -23,3 +25,4 @@ from .exporter import StdoutExporter, FileExporter, MysqlExporter, SqliteExporte
 
 import logging
 logging.getLogger(__name__).addHandler(logging.NullHandler())
+
