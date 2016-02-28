@@ -2,7 +2,7 @@ import logging
 import asyncio
 
 from .fetcher import CIDFetcher
-from .utils import CountLatch, parse_comments_xml, parse_rolldate_json, merge_xmls
+from .utils import CountLatch, CommentFlow
 from .exporter import FileExporter
 from .exceptions import Scavenger, DscraperError
 
@@ -83,9 +83,9 @@ class CIDCompany(BaseCompany):
         # Validate the item
         try:
             cid = int(cid)
-        except TypeError as e:
+        except TypeError:
             raise TypeError('invalid cid from input: an integer is required, not \'{}\''
-                            .format(type(cid).__name__)) from e
+                            .format(type(cid).__name__)) from None
         if cid <= 0:
             raise ValueError('invalid cid from input: a positive integer is required, not \'{}\''
                              .format(cid))
@@ -117,10 +117,9 @@ class AIDCompany(BaseCompany):
 class BaseWorker:
 
     def __init__(self, *, exporter, distributor, scavenger, fetcher):
-        self.exporter = exporter
-        self.distributor = distributor
-        self.scavenger = scavenger
-        self.fetcher = fetcher
+        self.exporter, self.distributor, self.scavenger, self.fetcher = \
+            exporter, distributor, scavenger, fetcher
+        self.item = None
         self._stopped = False
 
     async def run(self):
@@ -128,9 +127,9 @@ class BaseWorker:
             while not self._stopped and not self.scavenger.is_dead():
                 # TODO update progress, already scraped, current scraping
                 try:
-                    cid = await self.distributor.claim()
-                    xml, splitter = await self._next(cid)
-                    await self.exporter.dump(cid=cid, xml=xml, splitter=splitter)
+                    self.item = await self.distributor.claim()
+                    data = await self._next(self.item)
+                    await self.exporter.dump(item, data)
                 except StopIteration:
                     break
                 except DscraperError as e:
@@ -144,103 +143,148 @@ class BaseWorker:
         self._stopped = True
 
     async def _next(self, item):
+        """
+        :return object: data to be exported
+        """
         raise NotImplementedError
 
 class CommentWorker(BaseWorker):
+    """Scrape all comments by CID
+    """
+    # note: elements returned may not be sorted, for example /12.xml
+    # TODO int is not enough for comment_id. use long instead!
 
     def __init__(self, *, distributor, scavenger, exporter, history, loop, start=None, end=None):
-        # TODO set latest or earliest comment timestamp
         super().__init__(distributor=distributor, scavenger=scavenger, fetcher=CIDFetcher(loop=loop), exporter=exporter)
+        self.start, self.end = start or 0, end or CommentFlow.MAX_TIMESTAMP
         self.history = history
-        self.start = start or 0
-        self.end = end or 2147483647
+        self._time_range = start is None and end is None
 
     async def _next(self, cid):
-        # Get the data
-        root = parse_comments_xml(await self.fetcher.get_comments(cid))
-        # Get the history data
-        roll_dates = None
-        if self.history:
-            # Continue only if the latest data contains comments no less than it could at maximum
-            # note: the elements in XML are not always sorted by tags, for example /12.xml
-            limit = root.find('maxlimit')
-            try:
-                limit = int(limit.text)
-            except (TypeError, ValueError):
-                pass
-            else:
-                num_comments = len(root.findall('d') or [])
-                if num_comments >= limit:
-                    roll_dates = parse_rolldate_json(await self.fetcher.get_rolldate(cid))
-                    root = await self._history(root, roll_dates)
-        return (root, roll_dates)
+        """Make a minimum number of requests to scrape all comments including history.
 
-    async def _history(self, root, roll_dates):
-        """Scrapes all history comments on the Roll Date using minimum requests, and returns
-        the result in sorted order as one XML object.
-        Does not scrape all history files from the Roll Date unless some normal comments
-        in one of the files are not sorted by their timestamps, which is the fundamental
-        assumpution of the algorithm implemented here to reduce requests.
+        Deleted comments may exist on certain dates but not on others. This worker
+        does not guarantee that deleted comments are included, considering that
+        they are not supposed to appear anyway.
 
-        :param XML root:
-        :param JSON roll_dates:
-        :return XML:
+        Note: no equality can be used when comparing timestamps because of duplication
+        Note: if comments are not sorted, the first comment in each file is not
+            necessarily the earliest, but the timestamps in Roll Date are still valid
         """
-        xmls = []
-        latest_time = root # TODO
-        start, end = self.start, min(self.end, latest_time - 1)
-        # for($numRollDate = count($rollDates) - 1; $numRollDate >= 0; $numRollDate--)
+        # root is always scraped for headers, regardless of ending timestamp
+        root = await self.fetcher.get_comments_xml(cid)
+        limit = self._find_int(root, 'maxlimit', 1)
+        flow = CommentFlow(root, limit)
+        if self.history:
+            await self._history(cid, root, flow, limit)
+        if self._time_range:
+            flow.trim(self.start, self.end)
+        return flow
 
-        # loop through all rollDates to get comments and to insert them into database
-        idate = len(roll_dates) - 1
-        while idate >= 0:
-            pass
-            # look for the desirable the where the breakpoint locates or the first date
-            # while idate > 0:
-            # for inext_date in range(idate, 1, -1):
-            #     next_time = roll_dates[inext_date - 1]['timestamp']
-            #     if next_time <= headCommentTimestamp:
-            #         break
+    async def _history(cid, self, root, flow, limit):
+        # Check if there are history comments
+        segments = self._digest(root)
+        normal = segments[0]
+        if len(normal) < limit: # less comments than the file could contain
+            return
+        # Inspect both timestamp and count, because timestamp may not be provided
+        first_date = normal[0]._cmt_date
+        ds = self._find_int(root, 'ds', 0)
+        start, end = max(self.start, ds), min(self.end, first_date)
+        if start > end: # all comments are in time range already
+            return
 
-            # if($numRollDate >= 1)
-            # {
-            #     $nextRollDateTimestamp = $rollDates[$numRollDate - 1]->timestamp;
-            #     if($nextRollDateTimestamp > $headCommentTimestamp)
-            #     {
-            #         continue;
-            #     }
-            # }
+        # Scrape the history, and append each comment into its pool (normal/protected)
+        roll_dates = await self.fetcher.get_rolldate_json(cid)
+        # If time range is set, the comments are not splitted
+        if not self._time_range:
+            flow.set_splitter(roll_dates)
+        flow.prepend(*segments)
+        for idate in range(len(roll_dates) - 1, -1, -1):
+            if idate != 0:
+                if roll_dates[idate - 1]['timestamp'] > end:
+                    continue
+                elif roll_dates[idate]['timestamp'] < start:
+                    break
 
-            # # get uniserted comment entries of the date
-            # $segmentOfHistoryCommentsXml = $this->getCommentsXml($rollDates[$numRollDate]->timestamp);
-            # if(!($segmentOfHistoryCommentsXml instanceof DOMDocument))
-            # {
-            #     return $segmentOfHistoryCommentsXml;
-            # }
-            # $commentEntries = self::getSortedCommentsArray($segmentOfHistoryCommentsXml);
-            # for($i = count($commentEntries) - 1; $i >= 0; $i--)
-            # {
-            #     if($commentEntries[$i][self::CMTENT_ATTRIS][self::CMT_ID] < $headCommentId)
-            #     {
-            #         $commentEntries = array_slice($commentEntries, 0, $i + 1);
-            #         break;
-            #     }
-            # }
+            date = roll_dates[idate]['timestamp']
+            xml = await self.fetcher.get_comments_xml(cid, date)
+            segments = self._digest(xml)
+            if segments[1] or segments[2] or segments[3]:
+                _logger.debug('Special comments found at cid %d, %d', cid, date)
+            flow.prepend(*segments)
 
-            # $this->insertCommentEntries($commentEntries);
+            if len(normal) < limit:
+                break
+            end = normal[0]._cmt_date # assert len(normal) > 0 and date < end
+            if start > end:
+                break
 
-            # if(!$isCrawlingAll) # should be replaced by end timestamp and id
-            # {
-            #     break;
-            # }
+    @staticmethod
+    def _find_int(xml, tag, default):
+        element = xml.find(tag)
+        return int(element.text) if element is not None else default
 
-            # # update the breakpoint
-            # $headComment = array_shift($commentEntries);
-            # if(!$headComment)
-            # {
-            #     continue;
-            # }
-            # $headCommentTimestamp = $headComment[self::CMTENT_ATTRIS][self::CMT_DATE];
-            # $headCommentId = $headComment[self::CMTENT_ATTRIS][self::CMT_ID];
+    @staticmethod
+    def _digest(xml):
+        """
+        :return ([normal_comments], [protected_comments], [title_comments], [code_comments]):
+        """
+        # Note: structure of comment document:
+        #       +--------------------+
+        #       | Header             |
+        #       +--------------------+
+        #       | Normal comments    |
+        #       | ...                |
+        #       +--------------------+
+        #       | Protected comments |
+        #       | ...                |
+        #       +--------------------+
+        #       | Title comments     |
+        #       | ...                |
+        #       +--------------------+
+        #       | Code comments      |
+        #       | ...                |
+        #       +--------------------+
+        #
+        # In each segment, comments are supposed to be sorted by their IDs in an
+        # increasing order. Therefore, the ID of the last comment in a segment
+        # is larger than that of the next comment, which is the first one in the
+        # next segment. If we find these two comments, we also find the boundary
+        # between two segments.
+        # Unlike title and code comments, protected comments are not explicitly
+        # declared in the XML. The only way to distinguish protected comments
+        # from normal ones is to find the boundary between them.
+        #
+        # Note: if comments in any segment are not sorted, the output is undefined
 
-        return merge_xmls(xmls)
+        cmts = xml.findall('d')
+        length = len(cmts)
+        ifront = 0
+
+        irear = ifront
+        for i in range(irear - 1, -1, -1):
+            if cmts[i]._cmt_pool != 2:
+                ifront = i + 1
+                break
+        code = cmts[ifront:]
+
+        irear = ifront
+        for i in range(irear - 1, -1, -1):
+            if cmts[i]._cmt_pool != 1:
+                ifront = i + 1
+                break
+        title = cmts[ifront:irear]
+
+        irear = ifront
+        last_id = CommentFlow.MAX_CMT_ID
+        for i in range(irear - 1, -1, -1):
+            cmt_id = cmts[i]._cmt_id
+            if cmt_id > last_id: # boundary found
+                ifront = i + 1
+                break
+            last_id = cmt_id
+        protected = cmts[ifront:irear]
+
+        normal = cmts[:ifront] if ifront < length else cmts
+        return normal, protected, title, code
