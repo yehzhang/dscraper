@@ -2,17 +2,20 @@ import logging
 import asyncio
 import re
 from collections import defaultdict
+import zlib
 
-from .utils import FrequencyController, NullController, AutoConnector, get_headers_text, get_status_code, inflate_and_decode, strip_invalid_xml_chars
-from .exceptions import HostError, ConnectTimeout, ResponseError, MultipleErrors, NoResponseReadError, PageNotFound
+from .utils import FrequencyController, NullController, AutoConnector, parse_comments_xml, parse_rolldate_json, deserialize_comment_attributes
+from .exceptions import HostError, ConnectTimeout, ResponseError, MultipleErrors, NoResponseReadError, PageNotFound, DecodeError
 from . import __version__, _DEBUGGING
 
 _logger = logging.getLogger(__name__)
 
 
-_HOST_CID = 'comment.bilibili.com'
-_HOST_AID = 'bilibili.com'
-_PORT = 80
+HOST_CID = 'comment.bilibili.com'
+HOST_AID = 'bilibili.com'
+PORT = 80
+CURRENT_URI = '{cid}.xml'
+HISTORY_URI = 'dmroll,{timestamp},{cid}'
 
 class BaseFetcher:
     """High-level utility class that fetches data from bilibili.com.
@@ -32,7 +35,7 @@ class BaseFetcher:
 
     controllers = defaultdict(FrequencyController)
 
-    def __init__(self, host, port=_PORT, headers=None, *, loop):
+    def __init__(self, host, port=PORT, headers=None, *, loop):
         if not headers:
             headers = dict(self._DEFAULT_HEADERS)
         headers['Host'] = host
@@ -64,30 +67,37 @@ class BaseFetcher:
             return await self._session.get(uri)
         except (ConnectTimeout, MultipleErrors) as e:
             raise HostError('failed to read from the host') from e
-        except AttributeError as e:
-            raise RuntimeError('fetcher is not opened yet') from e
+        except AttributeError:
+            raise RuntimeError('fetcher is not opened yet') from None
 
 class CIDFetcher(BaseFetcher):
 
     def __init__(self, *, loop):
-        super().__init__(_HOST_CID, loop=loop)
+        super().__init__(HOST_CID, loop=loop)
 
-    async def get_comments(self, cid, timestamp=0):
-        if timestamp == 0:
-            uri = '/{}.xml'.format(cid)
+    async def get_comments(self, cid, date=0):
+        if date == 0:
+            uri = CURRENT_URI.format(cid=cid)
         else:
-            uri = '/dmroll,{},{}'.format(timestamp, cid)
-        text = await self.get(uri)
-        return strip_invalid_xml_chars(text)
+            uri = HISTORY_URI.format(timestamp=date, cid=cid)
+        return await self.get(uri)
 
     async def get_rolldate(self, cid):
         uri = '/rolldate,{}'.format(cid)
         return await self.get(uri)
 
+    async def get_comments_xml(self, cid, date=0):
+        xml = parse_comments_xml(await self.get_comments(cid, date))
+        deserialize_comment_attributes(xml)
+        return xml
+
+    async def get_rolldate_json(self, cid):
+        return parse_rolldate_json(await self.get_rolldate(cid))
+
 class MetaCIDFetcher(BaseFetcher):
 
     def __init__(self, *, loop):
-        super().__init__(_HOST_AID, loop=loop)
+        super().__init__(HOST_AID, loop=loop)
 
     async def get_cid(self, aid):
         """Get the Chat ID of the given AV ID. Alternatively uses the APIs
@@ -113,6 +123,7 @@ class Session(AutoConnector):
     """
     _REQUEST_TEMPLATE = 'GET {{uri}} HTTP/1.1\r\n{headers}\r\n'
     _READ_RETRIES = 2
+    _PATTERN_ST = re.compile(b'HTTP/1.1 (\\d+) ')
     _PATTERN_TE = re.compile(b'Transfer-Encoding: chunked\r\n')
     _PATTERN_CL = re.compile(b'Content-Length: (\\d+)\r\n')
     _PATTERN_TE_BEGIN = re.compile(b'^([0-9A-Fa-f]+)\r\n')
@@ -129,7 +140,8 @@ class Session(AutoConnector):
         self._reader = self._writer = None
 
     def set_headers(self, headers):
-        self._template = self._REQUEST_TEMPLATE.format(headers=get_headers_text(headers))
+        text = ''.join('{}:{}\r\n'.format(k, v) for k, v in headers.items())
+        self._template = self._REQUEST_TEMPLATE.format(headers=text)
 
     async def get(self, uri):
         """Retries on failure. Raises all distinct errors when max retries exceeded.
@@ -142,7 +154,7 @@ class Session(AutoConnector):
         retries = 0
         while True:
             try:
-                return await self._get(request)
+                headers, body = await self._get(request)
             except HostError as e:
                 errors.append(e)
                 if retries >= self._READ_RETRIES:
@@ -153,6 +165,12 @@ class Session(AutoConnector):
                 await asyncio.sleep(retries ** 2)
                 await self.connect()
                 retries += 1
+            else:
+                # check the status code
+                if self._get_status_code(headers) == 404:
+                    raise PageNotFound('{} is a 404 page'.format(uri))
+                # inflate and decode the body
+                return self._inflate_and_decode(body)
         raise MultipleErrors(errors)
 
     async def _get(self, request):
@@ -170,18 +188,14 @@ class Session(AutoConnector):
         # disassemble the response to check integrity
         try:
             headers, body = response.split(self._DOUBLE_BREAK, 1)
-        except ValueError as e:
+        except ValueError:
             _logger.debug('response: \n%s', response)
-            raise ResponseError('response from the host was invalid') from e
-        # check the status code
-        if get_status_code(headers) == 404:
-            raise PageNotFound('fetching a 404 page')
-        # inflate and decode the body
-        return inflate_and_decode(body)
+            raise ResponseError('response from the host was invalid') from None
+        return headers, body
 
     async def _read(self):
         response = b''
-        content_length = is_chunked = False
+        content_length = is_chunked = None
 
         while True:
             task = self._reader.read(16384)
@@ -208,14 +222,14 @@ class Session(AutoConnector):
                     try:
                         content, length, _ = self._PATTERN_TE_END.split(chunk, 1)
                         length = int(length, 16)
-                    except ValueError as e:
-                        raise ResponseError('response from the host was invalid') from e
+                    except ValueError:
+                        raise ResponseError('response from the host was invalid') from None
                     response += content
                     if length == 0:
                         break
 
             # Check if the response contains the 'Transfer-Encoding: chunked' header
-            elif content_length is False and self._PATTERN_TE.search(chunk):
+            elif content_length is None and self._PATTERN_TE.search(chunk):
                 is_chunked = True
                 chunk = chunk.rstrip(self._LINE_BREAK)
                 # The first chunk contains length 0 at the end
@@ -225,7 +239,7 @@ class Session(AutoConnector):
                     response += content
                     if length == 0:
                         break
-                except ValueError as e:
+                except ValueError:
                     # Or no length, usually
                     response += chunk
 
@@ -253,3 +267,21 @@ class Session(AutoConnector):
     async def disconnect(self):
         self._writer.close()
         self._reader = self._writer = None
+
+    def _get_status_code(self, raw):
+        match = self._PATTERN_ST.search(raw)
+        try:
+            return int(match.group(1))
+        except TypeError:
+            pass
+
+    @staticmethod
+    def _inflate_and_decode(raw):
+        dobj = zlib.decompressobj(-zlib.MAX_WBITS)
+        try:
+            inflated = dobj.decompress(raw)
+            inflated += dobj.flush()
+            return inflated.decode()
+        except (zlib.error, UnicodeDecodeError):
+            _logger.debug('cannot decode: \n%s', raw)
+            raise DecodeError('failed to decode the data from the response') from None

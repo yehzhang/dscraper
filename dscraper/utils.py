@@ -6,13 +6,15 @@ import asyncio
 import re
 import xml.etree.ElementTree as et
 import json
-import zlib
 import logging
+import itertools
 
-from .exceptions import ParseError, DecodeError, ContentError, ConnectTimeout
+from .exceptions import ParseError, ContentError, ConnectTimeout
 
 _logger = logging.getLogger(__name__)
 
+MAX_INT = 2147483647
+MAX_LONG = 9223372036854775807
 
 def decorator(d):
     return lambda f: update_wrapper(d(f), f)
@@ -59,41 +61,20 @@ def alock(coro):
     lock = asyncio.Lock()
     return _coro
 
-
-def get_headers_text(headers):
-    return ''.join('{}:{}\r\n'.format(k, v) for k, v in headers.items())
-
-def get_status_code(raw):
-    match = _PATTERN_ST.search(raw)
-    try:
-        return int(match.group(1))
-    except TypeError:
-        pass
-
-_PATTERN_ST = re.compile(b'HTTP/1.1 (\\d+) ')
-
-def inflate_and_decode(raw):
-    dobj = zlib.decompressobj(-zlib.MAX_WBITS)
-    try:
-        inflated = dobj.decompress(raw)
-        inflated += dobj.flush()
-        return inflated.decode()
-    except (zlib.error, UnicodeDecodeError) as e:
-        _logger.debug('cannot decode: \n%s', raw)
-        raise DecodeError('failed to decode the data from the response') from e
-
 def parse_comments_xml(text):
+    # Escape invalid XML chracters with their hexadecimal notations
+    text = _PATTERN_ILL_XML_CHR.sub(_REPL_ILL_XML_CHR, text)
+
     try:
         root = et.fromstring(text)
-    except et.ParseError as e:
-        raise ParseError('failed to parse the XML data') from e
+    except et.ParseError:
+        raise ParseError('failed to parse the XML data') from None
+
+    # Check content
     if root.text == 'error':
         raise ContentError('the XML data contains a single element with "error" as content')
-    return root
 
-def strip_invalid_xml_chars(text):
-    """Escape invalid XML chracters with their hexadecimal notations."""
-    return _PATTERN_ILL_XML_CHR.sub(_REPL_ILL_XML_CHR, text)
+    return root
 
 illegal_xml_chrs = [(0x00, 0x08), (0x0B, 0x0C),
                     (0x0E, 0x1F), (0x7F, 0x84),
@@ -115,52 +96,175 @@ del illegal_xml_chrs, illegal_ranges
 def deserialize_comment_attributes(root):
     for d in root.iterfind('d'):
         sattr = d.attrib.get('p')
-        offset, mode, font_size, color, date, pool_id, user_id, comment_id = sattr.split(',')
-        offset = float(offset)
-        if offset % 1 == 0:
-            offset = int(offset)
-        d.attrib = {
-            'offset': offset,
-            'mode': int(mode),
-            'font_size': int(font_size),
-            'color': int(color),
-            'date': int(date),
-            'pool_id': int(pool_id),
-            'user_id': user_id,
-            'comment_id': int(comment_id)
-        }
-
-def serialize_comment_attributes(root):
-    for d in root.iterfind('d'):
-        sattr = ','.join(map(lambda x: str(d.attrib[x]), SATTRIBUTE))
-        d.attrib = {'p': sattr}
-
-SATTRIBUTE = ('offset', 'mode', 'font_size', 'color', 'date', 'pool_id', 'user_id', 'comment_id')
+        offset, mode, font_size, color, date, pool, user, comment_id = sattr.split(',')
+        # offset = float(offset)
+        # if offset % 1 == 0:
+        #     offset = int(offset)
+        # d._cmt_attrs = {
+        #     'offset': offset,
+        #     'mode': int(mode),
+        #     'font_size': int(font_size),
+        #     'color': int(color),
+        #     'date': int(date),
+        #     'pool': int(pool),
+        #     'user': user,
+        #     'comment_id': int(comment_id)
+        # }
+        d._cmt_offset = offset
+        d._cmt_mode = mode
+        d._cmt_font_size = font_size
+        d._cmt_color = color
+        d._cmt_date = int(date)
+        d._cmt_pool = int(pool)
+        d._cmt_user = user
+        d._cmt_id = int(comment_id)
+        # d._cmt_user = int(user, 16)
+        # d._cmt_is_tourist = (user[0] == 'D')
+    # Add indentation to the last element
+    # What if there is not comment element?
+    # d.tail = CommentFlow.XML_ELEM_TAIL
 
 def parse_rolldate_json(text):
     try:
         return json.loads(text)
-    except json.JSONDecodeError as e:
-        raise ParseError('failed to parse the JSON data') from e
+    except json.JSONDecodeError:
+        raise ParseError('failed to parse the JSON data') from None
 
-def split_xml(xml, splitter):
-    if splitter is None:
-        return xml
-    # TODO get maxlimit and form the current xml, then form history xmls.
-    # remember to attach headers to all files
-    pass
 
-def merge_xmls(xmls):
-    # TODO
-    pass
+class CommentFlow:
+    """Data container class. Build a flow of comments from the lastest to the earliest.
+    Prepend must be called after each yield of iterscrape
 
-_CONNECT_RETRIES = 2
+    TODO: add choice of alternative splitting ways in case of no splitter present
+    """
+    MAX_TIMESTAMP = MAX_INT
+    MAX_CMT_ID = MAX_LONG
+    XML_ELEM_TAIL = '\n\t'
+    _ROOT_HEADERS = ('chatserver', 'chatid', 'mission', 'maxlimit', 'source',
+                     'ds', 'de', 'max_count')
+    _HISTORY_HEADERS = ('chatserver', 'chatid', 'mission', 'maxlimit', 'max_count')
+    _LEN_HEADER = len(_HISTORY_HEADERS)
+
+    def __init__(self, root, limit):
+        self.root, self.limit = root, limit
+        self.splitter = None
+        self._pools = ([], [], [], []) # normal, protected, title, code
+        self._flows = None
+
+    def prepend(self, normal, protected, title, code):
+        for segment, pool in zip((normal, protected, title, code), self._pools):
+            if segment:
+                pool.append(segment)
+
+    def set_splitter(self, splitter):
+        self.splitter = splitter
+
+    def can_split(self):
+        return bool(self.splitter)
+
+    def get_root(self):
+        return self.root
+
+    def get_header(self, lite=False):
+        """Return a list of XML elements containing metadata."""
+        header = []
+        for k in self._HISTORY_HEADERS if lite else self._ROOT_HEADERS:
+            elem = self.root.find(k)
+            if elem is None:
+                elem = et.Element(k)
+                elem.text = '0' if k != 'de' else str(self.MAX_TIMESTAMP)
+                elem.tail = self.XML_ELEM_TAIL
+                _logger.debug('metadata \"%s\" missing, using default value', k)
+            header.append(elem)
+        return header
+
+    def trim(self, start, end):
+        """Discard all comments not in the time range [start, end]
+        Also join all segments into flows internally.
+        """
+        self._flows = []
+        if start > end:
+            return
+        for flow in self._get_flows():
+            ifront, irear = self.MAX_CMT_ID, 0
+            for i, cmt in enumerate(flow):
+                if cmt._cmt_date >= start:
+                    ifront = i
+                    break
+            for i, cmt in enumerate(reversed(flow)):
+                if cmt._cmt_date <= end:
+                    irear = len(flow) - i
+                    break
+            self._flows.append(flow[ifront:irear])
+
+    def components(self):
+        """Return a list of headers and a list of all XML elements of comment,
+        including history.
+        """
+        return (self.get_header(), itertools.chain(*self._get_flows()))
+
+    def histories(self):
+        """Yields one XML for each of the timestamps in the Roll Dates provided
+        in iterscrape. If merge is False, XMLs are built as if they are directly
+        scraped from comment.bilibili.com/dmroll,[timestamp],[cid]
+
+        :yield (timestamp, XML):
+        """
+        if not self.splitter:
+            raise RuntimeError('no splitter available')
+        if not self._flows:
+            self._flows = self._get_flows()
+
+        header = self.get_header(True)
+        root = et.Element('i')
+        root[:] = header
+        root.text = self.XML_ELEM_TAIL # indentation
+        xml = et.ElementTree(root)
+
+        growers = list(map(self._grow, self._flows))
+        for grower in growers:
+            grower.send(None)
+        for date in (rd['timestamp'] for rd in self.splitter):
+            root[self._LEN_HEADER:] = itertools.chain(*map(lambda x: x.send(date), growers))
+            last_elem = root[-1]
+            last_elem.tail = '\n' # remove indentation of the last element
+            yield (date, xml)
+            last_elem.tail = self.XML_ELEM_TAIL
+
+    def _get_flows(self):
+        return map(self._join, self._pools)
+
+    def _grow(self, flow):
+        cmts = None
+        i, length = 0, len(flow)
+        while i < length:
+            date = yield cmts
+            for i in range(i, length):
+                if flow[i]._cmt_date > date:
+                    cmts = flow[max(i - self.limit, 0):i]
+                    break
+        while True:
+            yield flow
+
+    @staticmethod
+    def _join(segments):
+        """Join segments
+        """
+        flow = []
+        horizon = 0
+        for segment in reversed(segments):
+            for i, cmt in enumerate(segment):
+                if cmt._cmt_id > horizon:
+                    horizon = segment[-1]._cmt_id
+                    flow.extend(segment[i:])
+                    break
+        return flow
 
 class AutoConnector:
 
     template = '{}'
 
-    def __init__(self, timeout, fail_message=None, retries=_CONNECT_RETRIES, *, loop):
+    def __init__(self, timeout, fail_message=None, retries=2, *, loop):
         self._timeout = timeout
         self.loop = loop
         self.retries = retries
@@ -299,6 +403,7 @@ class Sluice:
             self._waiters.remove(fut)
 
 TIME_CONFIG_CN = (0, 1, 18, 22, timezone('Asia/Shanghai'))
+TIME_CONFIG_US = (0, 1, 18, 22, timezone('America/Los_Angeles'))
 
 class FrequencyController:
     """
@@ -311,6 +416,7 @@ class FrequencyController:
         int end: ending of the rush hour
         tzinfo timezone: time zone where the host is
     """
+    # TODO choose time config from the host's location
     def __init__(self, time_config=TIME_CONFIG_CN, *, loop=None):
         self.loop = loop or asyncio.get_event_loop()
         self.interval, self.busy_interval, start, end, self.tz = time_config
@@ -321,8 +427,8 @@ class FrequencyController:
                 self.rush_hours = set(range(start, end))
             else:
                 self.rush_hours = set(range(start, 24)) | set(range(0, end + 1))
-        except TypeError as e:
-            raise TypeError('hour must be integer') from e
+        except TypeError:
+            raise TypeError('hour must be integer') from None
         self._latch = asyncio.Semaphore(loop=loop)
         self._blocking = True
 

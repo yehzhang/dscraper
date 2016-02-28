@@ -113,12 +113,12 @@ class Scavenger:
         self.health = min(self.health + self.regen, self._max_health)
 
     def failure(self, worker, e):
-        # TODO log worker type
+        # TODO log worker type, change cid to aid or sth in logging
         if e is None:
-            _logger.exception('Unexpected exception occured when scraping cid %d', worker.cid)
+            _logger.exception('Unexpected exception occured when scraping cid %d', worker.item)
             self.health -= self._UNEXPECTED_DAMAGE
         else:
-            message = '{} at cid {}'.format(self.capitalize(e.args[0]), worker.cid)
+            message = '{} at cid {}'.format(self.capitalize(e.args[0]), worker.item)
             if e.__cause__:
                 message += ': ' + e.__cause__
             _logger.log(e.level, message)

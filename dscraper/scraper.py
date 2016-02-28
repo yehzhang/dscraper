@@ -33,7 +33,8 @@ class Scraper:
     """The main class of dcraper.
 
     Controls the operation and communication among other modules.
-    :TODO: add user interface during running using the curses library
+    TODO: add user interface during running using the curses library
+    TODO: add start and end timestamp. If set, always merge files. Or split by natural Roll Date?
     """
     MAX_WORKERS = 24
 
@@ -68,8 +69,8 @@ class Scraper:
         """
         try:
             target_iter = iter(targets)
-        except TypeError as e:
-            raise TypeError('target not iterable') from e
+        except TypeError:
+            raise TypeError('target not iterable') from None
         self._iters[company_type].append(target_iter)
 
     def run(self):
