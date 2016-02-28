@@ -3,7 +3,8 @@ __all__ = ()
 import logging
 import os
 
-from .utils import AutoConnector, split_xml
+from .fetcher import CURRENT_URI, HISTORY_URI
+from .utils import AutoConnector
 
 _logger = logging.getLogger(__name__)
 
@@ -19,24 +20,26 @@ class BaseExporter(AutoConnector):
     def __init__(self, fail_result=None, *, loop):
         super().__init__(_CONNECT_TIMEOUT, fail_result, loop=loop)
 
-    async def dump(self, *, cid=None, aid=None, xml=None, splitter=None):
+    async def dump(self, cid, flow, *, aid=None):
         """Export the data.
 
         :param int cid: chat ID, the identification number of the comments pool
             where the data came from
-        :param string text: the string to be dumped
-        :param XML xml: the XML object to be dumped
-        :param JSON splitter: the JSON object of Roll Date, which contains the information
-            on how a large chunk of comment entries are divided into pieces
 
         note::
-            At least one of the parameters text and xml must be supplied with data.
-            If both parameters have data passed in, the exporter will choose which one to use,
-            assuming that they are the same data in different format.
             If a splitter is provided, the data may be splitted into multiple parts
             on exporting. For example, FileExporter will save the comment entries as several
             files if a JSON object of Roll Date is provided. No splitter, no splitting.
         """
+        # :param XML header: elements attached at the top of each file,
+        #     usually metadata of CID
+        # :param XML body: joined elements at the center of all files,
+        #     usually unique, sorted, normal comments
+        # :param XML footer: elements attached at the bottom of each file,
+        #     usually protected comments
+        # :param JSON splitter: how body should be splitted, usually Roll Date, which
+        #     contains the information on how a large chunk of comment entries
+        #     are divided into pieces.
         raise NotImplementedError
 
 _CONNECT_TIMEOUT = 3.5
@@ -54,43 +57,49 @@ class StdoutExporter(BaseExporter):
     async def disconnect(self):
         self.connected = False
 
-    async def dump(self, *, cid=None, aid=None, xml=None, splitter=None):
+    async def dump(self, cid, flow, *, aid=None):
         if not self.connected:
             return
         # TODO
 
 class FileExporter(BaseExporter):
     """Save comments as XML files. The only exporter that supports splitting.
-
-    :param bool merge: whether to save comments into files divided by dates
-        as the website does, or to merge comments and save them as one file.
     """
-    _DIR_OUT = 'comments'
+    OUT_DIR = 'comments'
+    # TODO maybe not necessary
+    # :param bool merge: whether to save comments into files divided by dates
+    #     as the website does, or to merge comments and save them as one file.
 
-    def __init__(self, merge=False, path=None, *, loop):
+    def __init__(self, path=None, *, loop):
         super().__init__('Failed to save as files', loop=loop)
-        self.merge = merge
         if not path:
-            path = self._DIR_OUT
-        self.template = path + '/{}'
+            path = self.OUT_DIR
+        self._home = path
+        self._sub_path = os.path.join(path, '{}')
 
-    async def dump(self, *, cid=None, aid=None, xml=None, splitter=None):
-        if self.merge: # split
-            splitter = None
-        xmls = split_xml(xml, splitter)
-        current_xml, history_xmls = xmls[0], xmls[1:]
-        with open(self.template.format(cid + '.xml'), 'w') as fout:
-            # fout.write(current_xml.)
-            # TODO
-            pass
+    async def dump(self, cid, flow, *, aid=None):
+        # TODO if aid, dir: comments/av+aid/cid/*.xml
+        dirname = ''
+
+        if flow.can_split():
+            path = self._mkdir(cid)
+            src = os.path.join(path, HISTORY_URI)
+            for date, xml in flow.histories():
+                xml.write(src.format(cid=cid, timestamp=date), "utf-8", True)
+
+        root = flow.get_root()
+        root.write(os.path.join(path, CURRENT_URI).format(cid=cid), "utf-8", True)
 
     async def _open_connection(self):
-        path = self.template.format('')
-        if not os.path.exists(path):
-            os.mkdir(path)
+        self._mkdir('')
 
     async def disconnect(self):
         pass
+
+    def _mkdir(self, dirname):
+        path = os.path.join(self._home, str(dirname))
+        os.mkdir(path, parents=True, exist_ok=True)
+        return path
 
 class MysqlExporter(BaseExporter):
     """Intended features:
@@ -104,7 +113,7 @@ class MysqlExporter(BaseExporter):
         # if cmtdb is not created, create and set encoding
         # SET NAMES utf8mb4 COLLATE utf8mb4_unicode_ci;
 
-    async def dump(self, *, cid=None, aid=None, xml=None, splitter=None):
+    async def dump(self, cid, flow, *, aid=None):
         pass
 
     async def _open_connection(self):
@@ -118,7 +127,7 @@ class SqliteExporter(BaseExporter):
     def __init__(self, *, loop):
         super().__init__('Failed to insert into the database', loop=loop)
 
-    async def dump(self, *, cid=None, aid=None, xml=None, splitter=None):
+    async def dump(self, cid, flow, *, aid=None):
         pass
 
     async def _open_connection(self):
