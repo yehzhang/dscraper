@@ -4,7 +4,7 @@ import asyncio
 from .fetcher import CIDFetcher
 from .utils import CountLatch, CommentFlow
 from .exporter import FileExporter
-from .exceptions import Scavenger, DscraperError
+from .exceptions import Scavenger, DscraperError, NoMoreItems
 
 _logger = logging.getLogger(__name__)
 
@@ -28,7 +28,6 @@ class BaseCompany:
         # Export methods
         self.success = self.scavenger.success
         self.is_dead = self.scavenger.is_dead
-        self.__len__ = self._latch.__len__
 
     async def run(self):
         self._running = True
@@ -46,7 +45,7 @@ class BaseCompany:
             fut.add_done_callback(lambda x: self._latch.count_down())
             self._workers.add(worker)
         self._latch.count(num)
-        self.scavenger.set_recorders_by(num)
+        self.scavenger.set_recorders(len(self))
 
     def fire(self, num=1):
         assert num <= len(self) # DEBUG
@@ -54,7 +53,7 @@ class BaseCompany:
         for _ in range(num):
             worker, _ = self._workers.pop()
             worker.stop()
-        self.scavenger.set_recorders_by(-num)
+        self.scavenger.set_recorders(len(self))
 
     def failure(self, worker, e):
         self.scavenger.failure(worker, e)
@@ -67,16 +66,20 @@ class BaseCompany:
         self._closed = True
         self.fire(len(self._workers))
 
+    def __len__(self):
+        return len(self._latch)
+
 class CIDCompany(BaseCompany):
     """Taking charge of the CommentWorkers.
     """
     def __init__(self, distributor, *, scavenger=None, exporter=None, history=True, loop):
-        self.distributor = distributor
-        self.exporter = exporter or FileExporter(loop=loop)
         ctor = lambda: CommentWorker(distributor=self, exporter=self.exporter,
                                      scavenger=self, history=history, loop=loop)
         super().__init__(ctor, scavenger=scavenger, loop=loop)
-        self.post = self.distributor.post
+        self.distributor = distributor
+        self.exporter = exporter or FileExporter(loop=loop)
+        self.post = distributor.post
+        self.set = distributor.set
 
     async def claim(self):
         cid = await self.distributor.claim()
@@ -90,7 +93,7 @@ class CIDCompany(BaseCompany):
             raise ValueError('invalid cid from input: a positive integer is required, not \'{}\''
                              .format(cid))
         if self._closed:
-            raise StopIteration('call it a day')
+            raise NoMoreItems('call it a day')
         return cid
 
     def close(self):
@@ -127,10 +130,11 @@ class BaseWorker:
             while not self._stopped and not self.scavenger.is_dead():
                 # TODO update progress, already scraped, current scraping
                 try:
-                    self.item = await self.distributor.claim()
-                    data = await self._next(self.item)
+                    item = self.item = await self.distributor.claim()
+                    data = await self._next(item)
                     await self.exporter.dump(item, data)
-                except StopIteration:
+                except NoMoreItems:
+                    self.stop()
                     break
                 except DscraperError as e:
                     self.scavenger.failure(self, e)
@@ -138,6 +142,7 @@ class BaseWorker:
                     self.scavenger.failure(self, None)
                 else:
                     self.scavenger.success()
+        _logger.info('A worker is done')
 
     def stop(self):
         self._stopped = True
@@ -172,7 +177,7 @@ class CommentWorker(BaseWorker):
             necessarily the earliest, but the timestamps in Roll Date are still valid
         """
         # root is always scraped for headers, regardless of ending timestamp
-        root = await self.fetcher.get_comments_xml(cid)
+        root = await self.fetcher.get_comments_root(cid)
         limit = self._find_int(root, 'maxlimit', 1)
         flow = CommentFlow(root, limit)
         if self.history:
@@ -181,14 +186,14 @@ class CommentWorker(BaseWorker):
             flow.trim(self.start, self.end)
         return flow
 
-    async def _history(cid, self, root, flow, limit):
+    async def _history(self, cid, root, flow, limit):
         # Check if there are history comments
         segments = self._digest(root)
         normal = segments[0]
         if len(normal) < limit: # less comments than the file could contain
             return
         # Inspect both timestamp and count, because timestamp may not be provided
-        first_date = normal[0]._cmt_date
+        first_date = normal[0].attrib['date']
         ds = self._find_int(root, 'ds', 0)
         start, end = max(self.start, ds), min(self.end, first_date)
         if start > end: # all comments are in time range already
@@ -208,25 +213,25 @@ class CommentWorker(BaseWorker):
                     break
 
             date = roll_dates[idate]['timestamp']
-            xml = await self.fetcher.get_comments_xml(cid, date)
-            segments = self._digest(xml)
+            root = await self.fetcher.get_comments_root(cid, date)
+            segments = self._digest(root)
             if segments[1] or segments[2] or segments[3]:
                 _logger.debug('Special comments found at cid %d, %d', cid, date)
             flow.prepend(*segments)
 
             if len(normal) < limit:
                 break
-            end = normal[0]._cmt_date # assert len(normal) > 0 and date < end
+            end = normal[0].attrib['date'] # assert len(normal) > 0 and date < end
             if start > end:
                 break
 
     @staticmethod
-    def _find_int(xml, tag, default):
-        element = xml.find(tag)
+    def _find_int(root, tag, default):
+        element = root.find(tag)
         return int(element.text) if element is not None else default
 
     @staticmethod
-    def _digest(xml):
+    def _digest(root):
         """
         :return ([normal_comments], [protected_comments], [title_comments], [code_comments]):
         """
@@ -258,20 +263,21 @@ class CommentWorker(BaseWorker):
         #
         # Note: if comments in any segment are not sorted, the output is undefined
 
-        cmts = xml.findall('d')
+        # Add indentation to the last element
+        cmts = root.findall('d')
         length = len(cmts)
         ifront = 0
 
         irear = ifront
         for i in range(irear - 1, -1, -1):
-            if cmts[i]._cmt_pool != 2:
+            if cmts[i].attrib['pool'] != 2:
                 ifront = i + 1
                 break
         code = cmts[ifront:]
 
         irear = ifront
         for i in range(irear - 1, -1, -1):
-            if cmts[i]._cmt_pool != 1:
+            if cmts[i].attrib['pool'] != 1:
                 ifront = i + 1
                 break
         title = cmts[ifront:irear]
@@ -279,7 +285,7 @@ class CommentWorker(BaseWorker):
         irear = ifront
         last_id = CommentFlow.MAX_CMT_ID
         for i in range(irear - 1, -1, -1):
-            cmt_id = cmts[i]._cmt_id
+            cmt_id = cmts[i].attrib['id']
             if cmt_id > last_id: # boundary found
                 ifront = i + 1
                 break

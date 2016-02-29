@@ -81,50 +81,47 @@ class MultipleErrors(DscraperError):
         self.args = (message,)
         self.damage = max(damages)
 
+class NoMoreItems(DscraperError):
+    """A replacement of StopIteration in coroutines. Internal use only."""
+    damage = 0
 
 class Scavenger:
-    """
-    """
+    """Handles and logs all exceptions."""
     _MAX_HEALTH = 120
-    _REGEN_SPEED = 0.1
+    _REGEN = 12
     _UNEXPECTED_DAMAGE = 100
 
     def __init__(self):
         self.dead = False
-        self.health = self._max_health = self._MAX_HEALTH
-        self.regen = self._max_health * self._REGEN_SPEED
-        self.recorders = None
+        self._health = self._max_health = self._MAX_HEALTH
+        self._recorders = 1
 
-    def set_recorders_by(self, delta):
-        if self.recorders is None:
-            recorders = delta
-            self.recorders = 1
-        else:
-            recorders = self.recorders + delta
-        if recorders <= 0:
-            raise ValueError('cannot set \'{}\' recorders'.format(recorders))
-
-        self.health = self.health / self.recorders * recorders
-        self._max_health = self._MAX_HEALTH * recorders
-        self.regen = self._max_health * self._REGEN_SPEED * recorders
-        self.recorders = recorders
+    def set_recorders(self, num):
+        _logger.debug('set %d recorders', num)
+        if num < 0:
+            raise ValueError('cannot set \'{}\' recorders'.format(num))
+        self._health = self._health / self._recorders * num
+        self._max_health = self._MAX_HEALTH * num
+        self._recorders = num
 
     def success(self):
-        self.health = min(self.health + self.regen, self._max_health)
+        self._health = min(self._health + self._REGEN, self._max_health)
 
     def failure(self, worker, e):
         # TODO log worker type, change cid to aid or sth in logging
+        cid = str(worker.item) if worker.item else 'not started yet'
         if e is None:
-            _logger.exception('Unexpected exception occured when scraping cid %d', worker.item)
-            self.health -= self._UNEXPECTED_DAMAGE
+            _logger.exception('Unexpected exception occured when scraping cid %s', cid)
+            self._health -= self._UNEXPECTED_DAMAGE
         else:
-            message = '{} at cid {}'.format(self.capitalize(e.args[0]), worker.item)
+            message = '{} at cid {}'.format(self.capitalize(e.args[0]), cid)
             if e.__cause__:
                 message += ': ' + e.__cause__
             _logger.log(e.level, message)
-            self.health -= e.damage
-        if self.health <= 0:
+            self._health -= e.damage
+        if self._health <= 0:
             self.dead = True
+        _logger.debug('health: {} / {}, recorders: {}'.format(self._health, self._max_health, self._recorders))
 
     def is_dead(self):
         return self.dead

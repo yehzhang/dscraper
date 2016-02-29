@@ -4,7 +4,7 @@ from collections import deque
 from collections import defaultdict
 
 from .exporter import FileExporter
-from .exceptions import Scavenger
+from .exceptions import Scavenger, NoMoreItems
 from .utils import Sluice
 from .company import CIDCompany, AIDCompany, CID, AID
 
@@ -33,19 +33,20 @@ class Scraper:
     """The main class of dcraper.
 
     Controls the operation and communication among other modules.
-    TODO: add user interface during running using the curses library
-    TODO: add start and end timestamp. If set, always merge files. Or split by natural Roll Date?
+    TODO add user interface during running using the curses library
+    TODO add start and end timestamp. If set, always merge files. Or split by natural Roll Date?
+    TODO max_workers = 3? how to control max workers across companies? <- class variable
     """
     MAX_WORKERS = 24
 
-    def __init__(self, exporter=None, history=True, max_workers=6, *, loop=None): # TODO max_workers = 3?
+    def __init__(self, exporter=None, history=True, max_workers=6, *, loop=None):
         if not 0 < max_workers <= self.MAX_WORKERS:
             raise ValueError('number of workers is not in range [1, {}]'.format(self.MAX_WORKERS))
         self.loop = loop or asyncio.get_event_loop()
         self.exporter = exporter or FileExporter(loop=self.loop)
         self.history = history
         self.scavenger = Scavenger()
-        self.workers = max_workers
+        self.num_workers = max_workers
         self._iters = defaultdict(list)
 
     def add(self, target, company_type=CID):
@@ -77,7 +78,7 @@ class Scraper:
         scavenger = Scavenger()
         distributor = None
         exporter = self.exporter
-        workers = self.workers
+        num_workers = self.num_workers
         companies = []
 
         # TODO Build the AIDCompany
@@ -87,23 +88,23 @@ class Scraper:
         #     distributor.set()
         #     company = AIDCompany() # TODO
         #     distributor = company
-        #     aid_workers = min(round(workers / 3), 1)
-        #     workers -= aid_workers
+        #     aid_workers = min(round(num_workers / 3), 1)
+        #     num_workers -= aid_workers
         #     companies.append(company)
         #     for target in self._iters[AID]:
         #         company.post(target)
 
         # Build the CIDCompany
         if distributor is None:
-            # If there is no AIDCompany upstream, set the default distributor
+            # If there is no AIDCompany upstream, the CIDCompany needs an initial distributor
             distributor = Distributor(loop=self.loop)
-            distributor.set()
         company = CIDCompany(distributor, history=self.history,
                              scavenger=scavenger, exporter=exporter,
                              loop=self.loop)
-        company.hire(workers)
+        company.hire(num_workers)
         for target in self._iters[CID]:
             company.post(target)
+        company.set()
         companies.append(company)
 
         self.loop.run_until_complete(self.exporter.connect())
@@ -150,7 +151,7 @@ class Distributor:
                 if self._queue:
                     self._iter = self._queue.popleft()
                 elif self.is_set():
-                    raise StopIteration('no items available')
+                    raise NoMoreItems('all items have been distributed')
                 else:
                     # Wait until there are new items or this distributor is closed
                     await self._latch.wait()

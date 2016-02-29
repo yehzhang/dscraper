@@ -71,8 +71,8 @@ def parse_comments_xml(text):
         raise ParseError('failed to parse the XML data') from None
 
     # Check content
-    if root.text == 'error':
-        raise ContentError('the XML data contains a single element with "error" as content')
+    if root.text == 'error' or len(root) == 0:
+        raise ContentError('content of the XML document is invalid')
 
     return root
 
@@ -94,35 +94,35 @@ _REPL_ILL_XML_CHR = lambda x: r'\x{:02X}'.format(ord(x.group(0)))
 del illegal_xml_chrs, illegal_ranges
 
 def deserialize_comment_attributes(root):
+    for d in root:
+        d.tail = CommentFlow.XML_ELEM_TAIL
     for d in root.iterfind('d'):
-        sattr = d.attrib.get('p')
-        offset, mode, font_size, color, date, pool, user, comment_id = sattr.split(',')
-        # offset = float(offset)
-        # if offset % 1 == 0:
-        #     offset = int(offset)
-        # d._cmt_attrs = {
-        #     'offset': offset,
-        #     'mode': int(mode),
-        #     'font_size': int(font_size),
-        #     'color': int(color),
-        #     'date': int(date),
-        #     'pool': int(pool),
-        #     'user': user,
-        #     'comment_id': int(comment_id)
-        # }
-        d._cmt_offset = offset
-        d._cmt_mode = mode
-        d._cmt_font_size = font_size
-        d._cmt_color = color
-        d._cmt_date = int(date)
-        d._cmt_pool = int(pool)
-        d._cmt_user = user
-        d._cmt_id = int(comment_id)
+        attr_str = d.attrib.get('p')
+        offset, mode, font_size, color, date, pool, user, comment_id = attr_str.split(',')
+        d.attrib.update({
+            'offset': offset,
+            'mode': mode,
+            'font_size': font_size,
+            'color': color,
+            'date': int(date),
+            'pool': int(pool),
+            'user': user,
+            'id': int(comment_id)
+        })
+        # d._cmt_offset = offset
+        # d._cmt_mode = mode
+        # d._cmt_font_size = font_size
+        # d._cmt_color = color
+        # d.attrib['date'] = int(date)
+        # d.attrib['pool'] = int(pool)
+        # d._cmt_user = user
+        # d.attrib['id'] = int(comment_id)
         # d._cmt_user = int(user, 16)
         # d._cmt_is_tourist = (user[0] == 'D')
-    # Add indentation to the last element
-    # What if there is not comment element?
-    # d.tail = CommentFlow.XML_ELEM_TAIL
+
+def serialize_comment_attributes(root):
+    for d in root.iterfind('d'):
+        d.attrib = {'p': d.attrib['p']}
 
 def parse_rolldate_json(text):
     try:
@@ -132,7 +132,7 @@ def parse_rolldate_json(text):
 
 
 class CommentFlow:
-    """Data container class. Build a flow of comments from the lastest to the earliest.
+    """Data container class. Build a flow of comments from the latest to the earliest.
     Prepend must be called after each yield of iterscrape
 
     TODO: add choice of alternative splitting ways in case of no splitter present
@@ -146,10 +146,18 @@ class CommentFlow:
     _LEN_HEADER = len(_HISTORY_HEADERS)
 
     def __init__(self, root, limit):
-        self.root, self.limit = root, limit
+        self.latest = et.ElementTree(root)
+        self.limit = limit
         self.splitter = None
         self._pools = ([], [], [], []) # normal, protected, title, code
-        self._flows = None
+        self._flows_cache = None
+
+        last_elem = root[-1] # assert len(root) > 0
+        new_last_elem = et.Element(last_elem.tag, last_elem.attrib)
+        new_last_elem.text = last_elem.text
+        new_last_elem.tail = '\n' # remove indentation of the last element
+        new_last_elem[:] = last_elem
+        root[-1] = new_last_elem
 
     def prepend(self, normal, protected, title, code):
         for segment, pool in zip((normal, protected, title, code), self._pools):
@@ -162,14 +170,14 @@ class CommentFlow:
     def can_split(self):
         return bool(self.splitter)
 
-    def get_root(self):
-        return self.root
+    def get_latest(self):
+        return self.latest
 
     def get_header(self, lite=False):
         """Return a list of XML elements containing metadata."""
         header = []
         for k in self._HISTORY_HEADERS if lite else self._ROOT_HEADERS:
-            elem = self.root.find(k)
+            elem = self.latest.find(k)
             if elem is None:
                 elem = et.Element(k)
                 elem.text = '0' if k != 'de' else str(self.MAX_TIMESTAMP)
@@ -182,45 +190,39 @@ class CommentFlow:
         """Discard all comments not in the time range [start, end]
         Also join all segments into flows internally.
         """
-        self._flows = []
         if start > end:
             return
-        for flow in self._get_flows():
-            ifront, irear = self.MAX_CMT_ID, 0
+        for flow in self._flows:
+            length = len(flow)
+            ifront, irear = length, 0
             for i, cmt in enumerate(flow):
-                if cmt._cmt_date >= start:
+                if cmt.attrib['date'] >= start:
                     ifront = i
                     break
             for i, cmt in enumerate(reversed(flow)):
-                if cmt._cmt_date <= end:
-                    irear = len(flow) - i
+                if cmt.attrib['date'] <= end:
+                    irear = length - i
                     break
-            self._flows.append(flow[ifront:irear])
+            flow[:] = flow[ifront:irear]
 
     def components(self):
         """Return a list of headers and a list of all XML elements of comment,
         including history.
+        :return ([header_elements], [all_comment_elements]):
         """
-        return (self.get_header(), itertools.chain(*self._get_flows()))
+        return (self.get_header(), itertools.chain(*self._flows))
 
     def histories(self):
         """Yields one XML for each of the timestamps in the Roll Dates provided
         in iterscrape. If merge is False, XMLs are built as if they are directly
         scraped from comment.bilibili.com/dmroll,[timestamp],[cid]
 
-        :yield (timestamp, XML):
+        :yield (timestamp, ElementTree):
         """
         if not self.splitter:
             raise RuntimeError('no splitter available')
-        if not self._flows:
-            self._flows = self._get_flows()
 
-        header = self.get_header(True)
-        root = et.Element('i')
-        root[:] = header
-        root.text = self.XML_ELEM_TAIL # indentation
-        xml = et.ElementTree(root)
-
+        root, xml = self._get_xml_template(True)
         growers = list(map(self._grow, self._flows))
         for grower in growers:
             grower.send(None)
@@ -231,8 +233,32 @@ class CommentFlow:
             yield (date, xml)
             last_elem.tail = self.XML_ELEM_TAIL
 
-    def _get_flows(self):
-        return map(self._join, self._pools)
+    def all(self):
+        """Return a single XML object containing all comments.
+        :return XML:
+        """
+        flows = self._flows
+        if any(flows):
+            root, xml = self._get_xml_template(False)
+            root[self._LEN_HEADER:] = itertools.chain(*flows)
+            root[-1].tail = '\n' # remove indentation of the last element
+            return xml
+        else:
+            return self.latest
+
+    @property
+    def _flows(self):
+        if self._flows_cache is None:
+            self._flows_cache = map(self._join, self._pools)
+        return self._flows_cache
+
+    def _get_xml_template(self, lite_header):
+        header = self.get_header(lite_header)
+        root = et.Element('i')
+        root[:] = header
+        root.text = self.XML_ELEM_TAIL # indentation
+        xml = et.ElementTree(root)
+        return latest, xml
 
     def _grow(self, flow):
         cmts = None
@@ -240,7 +266,7 @@ class CommentFlow:
         while i < length:
             date = yield cmts
             for i in range(i, length):
-                if flow[i]._cmt_date > date:
+                if flow[i].attrib['date'] > date:
                     cmts = flow[max(i - self.limit, 0):i]
                     break
         while True:
@@ -254,8 +280,8 @@ class CommentFlow:
         horizon = 0
         for segment in reversed(segments):
             for i, cmt in enumerate(segment):
-                if cmt._cmt_id > horizon:
-                    horizon = segment[-1]._cmt_id
+                if cmt.attrib['id'] > horizon:
+                    horizon = segment[-1].attrib['id']
                     flow.extend(segment[i:])
                     break
         return flow
@@ -281,7 +307,7 @@ class AutoConnector:
         raise ConnectTimeout(message)
 
     async def disconnect(self):
-        raise NotImplementedError
+        pass
 
     async def _open_connection(self):
         raise NotImplementedError
@@ -332,7 +358,7 @@ class CountLatch:
         return released
 
     def __len__(self):
-        return min(self._value, 0)
+        return max(self._value, 0)
 
     async def wait(self):
         """Wait until the internal counter is not larger than zero."""
@@ -420,11 +446,11 @@ class FrequencyController:
     def __init__(self, time_config=TIME_CONFIG_CN, *, loop=None):
         self.loop = loop or asyncio.get_event_loop()
         self.interval, self.busy_interval, start, end, self.tz = time_config
-        if start > 23 or end < 0:
-            raise ValueError('hour must be in [0, 23]')
+        if not (0 <= start < 24 and 0 <= end < 24):
+            raise ValueError('hours not in the range(0, 24)')
         try:
-            if start < end:
-                self.rush_hours = set(range(start, end))
+            if start <= end:
+                self.rush_hours = set(range(start, end + 1))
             else:
                 self.rush_hours = set(range(start, 24)) | set(range(0, end + 1))
         except TypeError:
@@ -458,9 +484,5 @@ class FrequencyController:
 
 class NullController:
 
-    def __init__(self, *args, **kwargs):
-        pass
-
     async def wait(self):
         pass
-

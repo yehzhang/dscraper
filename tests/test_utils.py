@@ -20,9 +20,9 @@ class Test_Utils(unittest.TestCase):
 
     def test_serializer(self):
         filename = self.XML_FILES[0]
-        xml = et.parse(filename)
-        utils.deserialize_comment_attributes(xml)
-        utils.serialize_comment_attributes(xml)
+        root = et.parse(filename)
+        utils.deserialize_comment_attributes(root)
+        utils.serialize_comment_attributes(root)
         ref_xml = et.parse(filename)
         self.assertTrue(all(d1.attrib['p'] == d2.attrib['p'] for d1, d2 in
-                        zip(xml.iterfind('d'), ref_xml.iterfind('d'))))
+                        zip(root.iterfind('d'), ref_xml.iterfind('d'))))

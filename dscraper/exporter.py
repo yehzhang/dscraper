@@ -3,13 +3,12 @@ __all__ = ()
 import logging
 import os
 
-from .fetcher import CURRENT_URI, HISTORY_URI
-from .utils import AutoConnector
+from .fetcher import CURRENT_COMMENTS_FILENAME, HISTORY_COMMENTS_FILENAME
+from .utils import AutoConnector, serialize_comment_attributes
 
 _logger = logging.getLogger(__name__)
 
 # File, Stream, MySQL, SQLite
-# create dir, file
 
 # merge? autoflush/auto flush everytime?
 class BaseExporter(AutoConnector):
@@ -49,23 +48,22 @@ class StdoutExporter(BaseExporter):
 
     def __init__(self, *, loop):
         super().__init__('Failed to print to the console', loop=loop)
-        self.connected = False
 
     async def _open_connection(self):
-        self.connected = True
+        pass
 
     async def disconnect(self):
-        self.connected = False
+        pass
 
     async def dump(self, cid, flow, *, aid=None):
-        if not self.connected:
-            return
+        print('All comments from {} are the following: '.format(cid))
         # TODO
+        print()
 
 class FileExporter(BaseExporter):
     """Save comments as XML files. The only exporter that supports splitting.
     """
-    OUT_DIR = 'comments'
+    _OUT_DIR = 'comments'
     # TODO maybe not necessary
     # :param bool merge: whether to save comments into files divided by dates
     #     as the website does, or to merge comments and save them as one file.
@@ -73,33 +71,38 @@ class FileExporter(BaseExporter):
     def __init__(self, path=None, *, loop):
         super().__init__('Failed to save as files', loop=loop)
         if not path:
-            path = self.OUT_DIR
-        self._home = path
-        self._sub_path = os.path.join(path, '{}')
+            path = self._OUT_DIR
+        self._wd = self._home = path
 
     async def dump(self, cid, flow, *, aid=None):
         # TODO if aid, dir: comments/av+aid/cid/*.xml
-        dirname = ''
-
         if flow.can_split():
-            path = self._mkdir(cid)
-            src = os.path.join(path, HISTORY_URI)
+            # Normal mode, export all comments in a file structure similar to the original one
+            _logger.debug('Normal file export cid %s', str(cid))
+            self._cd(cid)
+            xml.write(flow.get_latest(), CURRENT_COMMENTS_FILENAME.format(cid=cid))
             for date, xml in flow.histories():
-                xml.write(src.format(cid=cid, timestamp=date), "utf-8", True)
-
-        root = flow.get_root()
-        root.write(os.path.join(path, CURRENT_URI).format(cid=cid), "utf-8", True)
+                self._write(xml, HISTORY_COMMENTS_FILENAME.format(cid=cid, timestamp=date))
+        else:
+            # Deviated mode. Either there is no history, or the time range is set.
+            # When I say there is no history, I mean the comments are too short to have
+            # history. Although there may be Roll Dates, dscraper does not request it
+            # for speed.
+            # No folder is created for each file
+            _logger.debug('Deviated file export cid %s', str(cid))
+            self._write(flow.all(), CURRENT_COMMENTS_FILENAME.format(cid=cid))
 
     async def _open_connection(self):
-        self._mkdir('')
+        self._cd('')
 
-    async def disconnect(self):
-        pass
-
-    def _mkdir(self, dirname):
+    def _cd(self, dirname):
         path = os.path.join(self._home, str(dirname))
-        os.mkdir(path, parents=True, exist_ok=True)
-        return path
+        os.makedirs(path, exist_ok=True)
+        self._wd = path
+
+    def _write(self, xml, filename):
+        serialize_comment_attributes(xml)
+        xml.write(os.path.join(self._wd, filename), "utf-8", True)
 
 class MysqlExporter(BaseExporter):
     """Intended features:

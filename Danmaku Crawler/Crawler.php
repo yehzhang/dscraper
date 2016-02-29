@@ -294,7 +294,7 @@ class Cralwer
 	 *
 	 * Gets the xml file of current cid, which could be an up-to-date or historical version, on $this->cid.
 	 *
-	 * @param int $timestamp the lastest timestamp of a date upon which the crawler can crawl. If not specified, the cralwer will crawl the up-to-date xml file. Only timestamps in rolldate can be specified
+	 * @param int $timestamp the latest timestamp of a date upon which the crawler can crawl. If not specified, the cralwer will crawl the up-to-date xml file. Only timestamps in rolldate can be specified
 	 * @return DOMDocument|boolean TRUE on nothing to crawl, FALSE on failure, and DOMDocument for the xml file crawled
 	 *
 	 */
@@ -387,8 +387,8 @@ class Cralwer
 	 * Crawls history comments on $this->cid within an adjustable range.
 	 * Since the 'new' property of $rollDate is unreliable, the crawler approximates to get all history comments in fewest possible times of fetching, which may result in skipping fetching part of history comments when occasionally the 'timestamp' property of $rollDate becomes unreliable as well
 	 *
-	 * @param int $headCommentTimestamp the lastest timestamp upon which the cralwer can crawl
-	 * @param int $headCommentId the lastest comment ID upon which the crawler can crawl
+	 * @param int $headCommentTimestamp the latest timestamp upon which the cralwer can crawl
+	 * @param int $headCommentId the latest comment ID upon which the crawler can crawl
 	 * @param boolean $isCrawlingAll should the crawler crawl all history comments prior to the head comment or crawl only comments following the head comment in one date
 	 * @return boolean TRUE on success and FALSE on failure
 	 *
