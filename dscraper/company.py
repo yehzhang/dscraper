@@ -163,7 +163,7 @@ class CommentWorker(BaseWorker):
         super().__init__(distributor=distributor, scavenger=scavenger, fetcher=CIDFetcher(loop=loop), exporter=exporter)
         self.start, self.end = start or 0, end or CommentFlow.MAX_TIMESTAMP
         self.history = history
-        self._time_range = start is None and end is None
+        self._time_range = start is not None or end is not None
 
     async def _next(self, cid):
         """Make a minimum number of requests to scrape all comments including history.
@@ -176,54 +176,73 @@ class CommentWorker(BaseWorker):
         Note: if comments are not sorted, the first comment in each file is not
             necessarily the earliest, but the timestamps in Roll Date are still valid
         """
-        # root is always scraped for headers, regardless of ending timestamp
-        root = await self.fetcher.get_comments_root(cid)
-        limit = self._find_int(root, 'maxlimit', 1)
-        flow = CommentFlow(root, limit)
-        if self.history:
-            await self._history(cid, root, flow, limit)
-        if self._time_range:
-            flow.trim(self.start, self.end)
+        # root is always scraped, regardless of ending timestamp. For complete header?
+        # Must be parsed as XML for formatting
+        latest = await self.fetcher.get_comments_root(cid)
+        limit = self._find_int(latest, 'maxlimit', 1)
+        histories, pools, roll_dates = await self._scrape_history(cid, latest, limit)
+        flows = None
+        if histories:
+            # Join segments into flows
+            flows = [self._join(reversed(pool)) for pool in pools]
+            # If time range is set, the comments are not splitted
+            if self._time_range:
+                for flow in flows:
+                    self._trim(flow, self.start, self.end)
+                roll_dates = None
+        flow = CommentFlow(latest, histories, flows, roll_dates, limit)
         return flow
 
-    async def _history(self, cid, root, flow, limit):
+    async def _scrape_history(self, cid, latest, limit):
+        """
+        :return histories, (normal_pool, protected_pool, title_pool, code_pool), roll_dates:
+            pool is a list of segments
+        """
+        if not self.history:
+            return None, None, None
         # Check if there are history comments
-        segments = self._digest(root)
+        segments = self._digest(latest)
+        pools = tuple([segment] for segment in segments)
         normal = segments[0]
         if len(normal) < limit: # less comments than the file could contain
-            return
-        # Inspect both timestamp and count, because timestamp may not be provided
+            return None, None, None
         first_date = normal[0].attrib['date']
-        ds = self._find_int(root, 'ds', 0)
+        ds = self._find_int(latest, 'ds', 0) # ds may not be provided
         start, end = max(self.start, ds), min(self.end, first_date)
         if start > end: # all comments are in time range already
-            return
+            return None, None, None
+        del normal, segments, first_date, ds
 
+        _logger.debug('scraping cid: %d', cid)
         # Scrape the history, and append each comment into its pool (normal/protected)
         roll_dates = await self.fetcher.get_rolldate_json(cid)
-        # If time range is set, the comments are not splitted
-        if not self._time_range:
-            flow.set_splitter(roll_dates)
-        flow.prepend(*segments)
+        _logger.debug('roll_dates:\n%s', roll_dates)
+        histories = {}
         for idate in range(len(roll_dates) - 1, -1, -1):
             if idate != 0:
-                if roll_dates[idate - 1]['timestamp'] > end:
+                if roll_dates[idate - 1] > end:
                     continue
-                elif roll_dates[idate]['timestamp'] < start:
+                elif roll_dates[idate] < start: # if idate == 0, assert roll_dates[idate] >= start
                     break
 
-            date = roll_dates[idate]['timestamp']
+            date = roll_dates[idate]
+            _logger.debug('scraping timestamp: %s', date)
             root = await self.fetcher.get_comments_root(cid, date)
             segments = self._digest(root)
             if segments[1] or segments[2] or segments[3]:
                 _logger.debug('Special comments found at cid %d, %d', cid, date)
-            flow.prepend(*segments)
+            for pool, segment in zip(pools, segments):
+                pool.append(segment)
+            histories[date] = root
 
+            normal = segments[0]
             if len(normal) < limit:
                 break
             end = normal[0].attrib['date'] # assert len(normal) > 0 and date < end
             if start > end:
                 break
+
+        return histories, pools, roll_dates
 
     @staticmethod
     def _find_int(root, tag, default):
@@ -265,15 +284,14 @@ class CommentWorker(BaseWorker):
 
         # Add indentation to the last element
         cmts = root.findall('d')
-        length = len(cmts)
-        ifront = 0
+        ifront = length = len(cmts)
 
         irear = ifront
         for i in range(irear - 1, -1, -1):
             if cmts[i].attrib['pool'] != 2:
                 ifront = i + 1
                 break
-        code = cmts[ifront:]
+        code = cmts[ifront:irear]
 
         irear = ifront
         for i in range(irear - 1, -1, -1):
@@ -294,3 +312,35 @@ class CommentWorker(BaseWorker):
 
         normal = cmts[:ifront] if ifront < length else cmts
         return normal, protected, title, code
+
+    @staticmethod
+    def _join(segments):
+        """Join a list of mostly ascending segments."""
+        flow = []
+        horizon = 0
+        for segment in segments:
+            for i, cmt in enumerate(segment):
+                if cmt.attrib['id'] > horizon:
+                    horizon = segment[-1].attrib['id']
+                    flow.extend(segment[i:])
+                    break
+        return flow
+
+    @staticmethod
+    def _trim(flow, start, end):
+        """Discard all comments not in the time range [start, end]
+        Also join all segments into flows internally.
+        """
+        if start > end:
+            return
+        length = len(flow)
+        ifront, irear = length, 0
+        for i, cmt in enumerate(flow):
+            if cmt.attrib['date'] >= start:
+                ifront = i
+                break
+        for i, cmt in enumerate(reversed(flow)):
+            if cmt.attrib['date'] <= end:
+                irear = length - i
+                break
+        flow[:] = flow[ifront:irear]

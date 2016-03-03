@@ -11,7 +11,7 @@ class DscraperError(Exception):
     Manual retrying is not recommended until the problem causing this error is
     solved, because Dscraper has retried automatically.
     """
-    damage = 0 # too many exceptions triggered will kill the scraper
+    damage = 1
     level = logging.INFO
 
     def __init__(self, message=None, logging_level=True):
@@ -83,7 +83,6 @@ class MultipleErrors(DscraperError):
 
 class NoMoreItems(DscraperError):
     """A replacement of StopIteration in coroutines. Internal use only."""
-    damage = 0
 
 class Scavenger:
     """Handles and logs all exceptions."""
@@ -121,7 +120,7 @@ class Scavenger:
             self._health -= e.damage
         if self._health <= 0:
             self.dead = True
-        _logger.debug('health: {} / {}, recorders: {}'.format(self._health, self._max_health, self._recorders))
+        _logger.debug('health: %d / %d, recorders: %d', self._health, self._max_health, self._recorders)
 
     def is_dead(self):
         return self.dead

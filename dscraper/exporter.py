@@ -2,9 +2,9 @@ __all__ = ()
 
 import logging
 import os
+from xml.sax.saxutils import escape
 
-from .fetcher import CURRENT_COMMENTS_FILENAME, HISTORY_COMMENTS_FILENAME
-from .utils import AutoConnector, serialize_comment_attributes
+from .utils import AutoConnector
 
 _logger = logging.getLogger(__name__)
 
@@ -61,48 +61,71 @@ class StdoutExporter(BaseExporter):
         print()
 
 class FileExporter(BaseExporter):
-    """Save comments as XML files. The only exporter that supports splitting.
+    """Save comments as XML files.
+
+    :param str path: path to put files. Default as 'comments/' under the current
+        working directory.
+    :param bool merge: whether save all comments in one file along with history,
+        or keep them separate as the original form. Notice: if choose not to
+        merge files, the resulting files could take huge space because of
+        duplication.
     """
     _OUT_DIR = 'comments'
-    # TODO maybe not necessary
-    # :param bool merge: whether to save comments into files divided by dates
-    #     as the website does, or to merge comments and save them as one file.
+    _LAST_CMTS_FN = '{cid}.xml'
+    _HIST_CMTS_FN = '{date},{cid}.xml'
 
-    def __init__(self, path=None, *, loop):
+    def __init__(self, path=None, merge=False, *, loop):
         super().__init__('Failed to save as files', loop=loop)
         if not path:
             path = self._OUT_DIR
         self._wd = self._home = path
+        self._split = not merge
 
     async def dump(self, cid, flow, *, aid=None):
         # TODO if aid, dir: comments/av+aid/cid/*.xml
-        if flow.can_split():
-            # Normal mode, export all comments in a file structure similar to the original one
-            _logger.debug('Normal file export cid %s', str(cid))
+        # Has history? -> no dir, latest comments as one file
+        # Otherwise, can split? -> dir, latest comments as one file, history comments as files
+        # Otherwise -> no dir, all comments as one file
+        # One file -> no dir, files -> dir
+        self._cd('')
+        latest_filename = self._LAST_CMTS_FN.format(cid=cid)
+        if not flow.has_history():
+            _logger.debug('No history cid %s', str(cid))
+            self._write(flow.get_latest(), latest_filename)
+        elif flow.can_split() and self._split:
+            _logger.debug('Has splitter cid %s', str(cid))
             self._cd(cid)
-            xml.write(flow.get_latest(), CURRENT_COMMENTS_FILENAME.format(cid=cid))
-            for date, xml in flow.histories():
-                self._write(xml, HISTORY_COMMENTS_FILENAME.format(cid=cid, timestamp=date))
+            self._write(flow.get_latest(), latest_filename)
+            for date, root in flow.get_histories():
+                self._write(root, self._HIST_CMTS_FN.format(cid=cid, date=date))
         else:
-            # Deviated mode. Either there is no history, or the time range is set.
-            # When I say there is no history, I mean the comments are too short to have
-            # history. Although there may be Roll Dates, dscraper does not request it
-            # for speed.
-            # No folder is created for each file
-            _logger.debug('Deviated file export cid %s', str(cid))
-            self._write(flow.all(), CURRENT_COMMENTS_FILENAME.format(cid=cid))
+            _logger.debug('Has history but no splitter, cid %s', str(cid))
+            self._write(flow.get_document(), latest_filename)
 
     async def _open_connection(self):
-        self._cd('')
+        pass
 
-    def _cd(self, dirname):
-        path = os.path.join(self._home, str(dirname))
+    def _cd(self, path):
+        """Change working directory from home."""
+        path = os.path.join(self._home, str(path))
         os.makedirs(path, exist_ok=True)
         self._wd = path
 
-    def _write(self, xml, filename):
-        serialize_comment_attributes(xml)
-        xml.write(os.path.join(self._wd, filename), "utf-8", True)
+    def _write(self, elements, filename):
+        header_line = '\t<{tag}>{text}</{tag}>\n'
+        cmt_line = '\t<d p="{attrs}">{text}</d>\n'
+
+        with open(os.path.join(self._wd, filename), 'w') as fout:
+            fout.write('<?xml version="1.0" encoding="UTF-8"?>\n<i>\n')
+            for elem in elements:
+                text = escape(elem.text) if elem.text else ''
+                if elem.tag == 'd':
+                    line = cmt_line.format(attrs=elem.attrib['p'], text=text)
+                else:
+                    line = header_line.format(tag=elem.tag, text=text)
+                fout.write(line)
+            fout.write('</i>')
+
 
 class MysqlExporter(BaseExporter):
     """Intended features:

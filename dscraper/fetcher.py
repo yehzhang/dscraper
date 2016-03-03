@@ -4,7 +4,7 @@ import re
 from collections import defaultdict
 import zlib
 
-from .utils import FrequencyController, NullController, AutoConnector, parse_comments_xml, parse_rolldate_json, deserialize_comment_attributes
+from .utils import FrequencyController, NullController, AutoConnector, parse_comments_xml, parse_rolldate_json, escape_invalid_xml_chars
 from .exceptions import HostError, ConnectTimeout, ResponseError, MultipleErrors, NoResponseReadError, PageNotFound, DecodeError
 from . import __version__, _DEBUGGING
 
@@ -14,8 +14,6 @@ _logger = logging.getLogger(__name__)
 HOST_CID = 'comment.bilibili.com'
 HOST_AID = 'bilibili.com'
 PORT = 80
-CURRENT_COMMENTS_FILENAME = '{cid}.xml'
-HISTORY_COMMENTS_FILENAME = 'dmroll,{timestamp},{cid}'
 
 class BaseFetcher:
     """High-level utility class that fetches data from bilibili.com.
@@ -71,8 +69,9 @@ class BaseFetcher:
             raise RuntimeError('fetcher is not opened yet') from None
 
 class CIDFetcher(BaseFetcher):
-    CURRENT_URI = '/' + CURRENT_COMMENTS_FILENAME
-    HISTORY_URI = '/' + HISTORY_COMMENTS_FILENAME
+    CURRENT_URI = '/{cid}.xml'
+    HISTORY_URI = '/dmroll,{timestamp},{cid}'
+    ROLLDATE_URI = '/rolldate,{cid}'
 
     def __init__(self, *, loop):
         super().__init__(HOST_CID, loop=loop)
@@ -83,16 +82,17 @@ class CIDFetcher(BaseFetcher):
             # uri = CURRENT_COMMENTS_FILENAME.format(cid=cid)
         else:
             uri = self.HISTORY_URI.format(timestamp=date, cid=cid)
-        return await self.get(uri)
+
+        text = await self.get(uri)
+        # Escape invalid XML chracters with their hexadecimal notations
+        return escape_invalid_xml_chars(text)
 
     async def get_rolldate(self, cid):
-        uri = '/rolldate,{}'.format(cid)
+        uri = self.ROLLDATE_URI.format(cid=cid)
         return await self.get(uri)
 
     async def get_comments_root(self, cid, date=0):
-        root = parse_comments_xml(await self.get_comments(cid, date))
-        deserialize_comment_attributes(root)
-        return root
+        return parse_comments_xml(await self.get_comments(cid, date))
 
     async def get_rolldate_json(self, cid):
         return parse_rolldate_json(await self.get_rolldate(cid))
