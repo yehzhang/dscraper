@@ -2,6 +2,7 @@ import unittest
 import asyncio
 import time
 
+
 def timer(fn, message, *args, **kwargs):
     start = time.time()
     result = fn(*args, **kwargs)
@@ -9,6 +10,7 @@ def timer(fn, message, *args, **kwargs):
     elapsed = round(end - start, 3)
     print('\n{}: {:.2f}'.format(message, elapsed))
     return result
+
 
 class Test(unittest.TestCase):
 
@@ -20,3 +22,4 @@ class Test(unittest.TestCase):
     @classmethod
     def tearDownClass(cls):
         cls.loop.close()
+

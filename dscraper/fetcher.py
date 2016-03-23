@@ -4,9 +4,11 @@ import re
 from collections import defaultdict
 import zlib
 
-from .utils import FrequencyController, NullController, AutoConnector, parse_comments_xml, parse_rolldate_json, escape_invalid_xml_chars
-from .exceptions import HostError, ConnectTimeout, ResponseError, MultipleErrors, NoResponseReadError, PageNotFound, DecodeError
-from . import __version__, _DEBUGGING
+from .utils import (FrequencyController, AutoConnector, parse_comments_xml,
+                    parse_rolldate_json, escape_invalid_xml_chars)
+from .exceptions import (HostError, ConnectTimeout, ResponseError, MultipleErrors,
+                         NoResponseReadError, PageNotFound, DecodeError)
+from . import __version__
 
 _logger = logging.getLogger(__name__)
 
@@ -14,6 +16,7 @@ _logger = logging.getLogger(__name__)
 HOST_CID = 'comment.bilibili.com'
 HOST_AID = 'bilibili.com'
 PORT = 80
+
 
 class BaseFetcher:
     """High-level utility class that fetches data from bilibili.com.
@@ -37,7 +40,7 @@ class BaseFetcher:
         if not headers:
             headers = dict(self._DEFAULT_HEADERS)
         headers['Host'] = host
-        self._controller = self.controllers[host] if not _DEBUGGING else NullController()
+        self._controller = self.controllers[host]
         self._session = Session(host, port, headers, loop=loop)
         # Export the methods
         self.open = self._session.connect
@@ -68,6 +71,7 @@ class BaseFetcher:
         except AttributeError:
             raise RuntimeError('fetcher is not opened yet') from None
 
+
 class CIDFetcher(BaseFetcher):
     CURRENT_URI = '/{cid}.xml'
     HISTORY_URI = '/dmroll,{timestamp},{cid}'
@@ -97,6 +101,7 @@ class CIDFetcher(BaseFetcher):
     async def get_rolldate_json(self, cid):
         return parse_rolldate_json(await self.get_rolldate(cid))
 
+
 class MetaCIDFetcher(BaseFetcher):
 
     def __init__(self, *, loop):
@@ -118,6 +123,7 @@ class MetaCIDFetcher(BaseFetcher):
         # r = requests.get("http://www.bilibilijj.com/Api/AvToCid/2398023/1")
 
 _DEFAULT_TIMEOUT = (3, 14)
+
 
 class Session(AutoConnector):
     """Socket-level interface dealing with crude HTTP stuff. Made as a substitution
@@ -253,7 +259,7 @@ class Session(AutoConnector):
                 if match:
                     content_length = int(match.group(1))
                     try:
-                        headers, body = response.split(self._DOUBLE_BREAK, 1)
+                        _, body = response.split(self._DOUBLE_BREAK, 1)
                     except ValueError:
                         pass
                     else:

@@ -1,5 +1,3 @@
-__all__ = ()
-
 import logging
 import os
 from xml.sax.saxutils import escape
@@ -8,14 +6,13 @@ from .utils import AutoConnector
 
 _logger = logging.getLogger(__name__)
 
-# File, Stream, MySQL, SQLite
 
-# merge? autoflush/auto flush everytime?
 class BaseExporter(AutoConnector):
     """Export an XML object to various destinations.
 
     :param string fail_result: what would happen if connection to the destination timed out
     """
+
     def __init__(self, fail_result=None, *, loop):
         super().__init__(_CONNECT_TIMEOUT, fail_result, loop=loop)
 
@@ -26,22 +23,12 @@ class BaseExporter(AutoConnector):
             where the data came from
 
         note::
-            If a splitter is provided, the data may be splitted into multiple parts
-            on exporting. For example, FileExporter will save the comment entries as several
-            files if a JSON object of Roll Date is provided. No splitter, no splitting.
+            Comment elements in XML are always omitted.
         """
-        # :param XML header: elements attached at the top of each file,
-        #     usually metadata of CID
-        # :param XML body: joined elements at the center of all files,
-        #     usually unique, sorted, normal comments
-        # :param XML footer: elements attached at the bottom of each file,
-        #     usually protected comments
-        # :param JSON splitter: how body should be splitted, usually Roll Date, which
-        #     contains the information on how a large chunk of comment entries
-        #     are divided into pieces.
         raise NotImplementedError
 
 _CONNECT_TIMEOUT = 3.5
+
 
 class StdoutExporter(BaseExporter):
     """Prints human-readable comment entries to stdout."""
@@ -56,9 +43,9 @@ class StdoutExporter(BaseExporter):
         pass
 
     async def dump(self, cid, flow, *, aid=None):
-        print('All comments from {} are the following: '.format(cid))
-        # TODO
-        print()
+        print('Comments from {}: \n'.format(cid))
+        print(FileExporter.tostring(flow.get_document()))
+
 
 class FileExporter(BaseExporter):
     """Save comments as XML files.
@@ -71,8 +58,6 @@ class FileExporter(BaseExporter):
         duplication.
     """
     _OUT_DIR = 'comments'
-    _LAST_CMTS_FN = '{cid}.xml'
-    _HIST_CMTS_FN = '{date},{cid}.xml'
 
     def __init__(self, path=None, merge=False, *, loop):
         super().__init__('Failed to save as files', loop=loop)
@@ -83,48 +68,47 @@ class FileExporter(BaseExporter):
 
     async def dump(self, cid, flow, *, aid=None):
         # TODO if aid, dir: comments/av+aid/cid/*.xml
-        # Has history? -> no dir, latest comments as one file
-        # Otherwise, can split? -> dir, latest comments as one file, history comments as files
-        # Otherwise -> no dir, all comments as one file
-        # One file -> no dir, files -> dir
-        self._cd('')
-        latest_filename = self._LAST_CMTS_FN.format(cid=cid)
+        self._cd()
         if not flow.has_history():
-            _logger.debug('No history cid %s', str(cid))
-            self._write(flow.get_latest(), latest_filename)
+            _logger.debug('No history at cid %s', str(cid))
+            latest = flow.get_latest()
         elif flow.can_split() and self._split:
-            _logger.debug('Has splitter cid %s', str(cid))
+            _logger.debug('History is splitted at cid %s', str(cid))
             self._cd(cid)
-            self._write(flow.get_latest(), latest_filename)
             for date, root in flow.get_histories():
-                self._write(root, self._HIST_CMTS_FN.format(cid=cid, date=date))
+                self._write(root, '{date},{cid}.xml'.format(cid=cid, date=date))
+            latest = flow.get_latest()
         else:
-            _logger.debug('Has history but no splitter, cid %s', str(cid))
-            self._write(flow.get_document(), latest_filename)
+            _logger.debug('History is merged at cid %s', str(cid))
+            latest = flow.get_document()
+        self._write(latest, '{cid}.xml'.format(cid=cid))
 
     async def _open_connection(self):
         pass
 
-    def _cd(self, path):
+    def _cd(self, path=''):
         """Change working directory from home."""
         path = os.path.join(self._home, str(path))
         os.makedirs(path, exist_ok=True)
         self._wd = path
 
+    # TODO performance if using run_in_executor?
     def _write(self, elements, filename):
-        header_line = '\t<{tag}>{text}</{tag}>\n'
-        cmt_line = '\t<d p="{attrs}">{text}</d>\n'
-
         with open(os.path.join(self._wd, filename), 'w') as fout:
-            fout.write('<?xml version="1.0" encoding="UTF-8"?>\n<i>\n')
-            for elem in elements:
-                text = escape(elem.text) if elem.text else ''
-                if elem.tag == 'd':
-                    line = cmt_line.format(attrs=elem.attrib['p'], text=text)
-                else:
-                    line = header_line.format(tag=elem.tag, text=text)
-                fout.write(line)
-            fout.write('</i>')
+            fout.write(self.tostring(elements))
+
+    @staticmethod
+    def tostring(elements):
+        lines = ['<?xml version="1.0" encoding="UTF-8"?>\n<i>']
+        for elem in elements:
+            text = escape(elem.text) if elem.text else ''
+            if elem.tag == 'd':
+                line = '\t<d p="{attrs}">{text}</d>'.format(attrs=elem.attrib['p'], text=text)
+            else:
+                line = '\t<{tag}>{text}</{tag}>'.format(tag=elem.tag, text=text)
+            lines.append(line)
+        lines.append('</i>')
+        return '\n'.join(lines)
 
 
 class MysqlExporter(BaseExporter):
@@ -140,6 +124,9 @@ class MysqlExporter(BaseExporter):
         # SET NAMES utf8mb4 COLLATE utf8mb4_unicode_ci;
 
     async def dump(self, cid, flow, *, aid=None):
+        # TODO
+        # d._user = int(user, 16)
+        # d._is_tourist = (user[0] == 'D')
         pass
 
     async def _open_connection(self):
@@ -147,6 +134,7 @@ class MysqlExporter(BaseExporter):
 
     async def disconnect(self):
         pass
+
 
 class SqliteExporter(BaseExporter):
 

@@ -91,11 +91,7 @@ def parse_comments_xml(text):
     if root.text == 'error' or len(root) == 0:
         raise ContentError('content of the XML document is invalid')
 
-    deserialize_comment_attributes(root)
-
-    return root
-
-def deserialize_comment_attributes(root):
+    # deserialize attributes
     for d in root.iterfind('d'):
         offset, mode, font_size, color, date, pool, user, cmt_id = d.attrib['p'].split(',')
         d.attrib = {
@@ -109,8 +105,8 @@ def deserialize_comment_attributes(root):
             'id': int(cmt_id),
             'p': d.attrib['p']
         }
-        # d._user = int(user, 16)
-        # d._is_tourist = (user[0] == 'D')
+
+    return root
 
 def parse_rolldate_json(text):
     try:
@@ -125,8 +121,6 @@ def parse_rolldate_json(text):
 
 class CommentFlow:
     """Data container class. Keeps all comments in a flow and cuts a piece from it for export.
-
-    TODO: add choice of alternative splitting ways in case of no splitter available
     """
     MAX_TIMESTAMP = MAX_INT
     MAX_CMT_ID = MAX_LONG
@@ -365,41 +359,39 @@ class Sluice:
         finally:
             self._waiters.remove(fut)
 
-TIME_CONFIG_CN = (0, 1, 18, 22, timezone('Asia/Shanghai'))
-TIME_CONFIG_US = (0, 1, 18, 22, timezone('America/Los_Angeles'))
+TIME_CONFIG_CN = (0, 1, 18, 22.5, timezone('Asia/Shanghai'))
+TIME_CONFIG_US = (0, 1, 18, 22.5, timezone('America/Los_Angeles'))
 
 class FrequencyController:
     """
     Limits the frequency of coroutines running across.
 
     :param tuple time_config: a 5-tuple of the configuration of the controller's behavior
-        number interval: duration of waiting in common hours
-        number busy_interval: duration of waiting in rush hours
-        int start: beginning of the rush hour
-        int end: ending of the rush hour
+        float interval: duration of waiting in common hours
+        float busy_interval: duration of waiting in rush hours
+        float start: beginning of the rush hour
+        float end: end of the rush hour
         tzinfo timezone: time zone where the host is
     """
-    # TODO choose time config from the host's location
+    # TODO choose time config from the host's geolocation
     def __init__(self, time_config=TIME_CONFIG_CN, *, loop=None):
         self.loop = loop or asyncio.get_event_loop()
         self.interval, self.busy_interval, start, end, self.tz = time_config
         if not (0 <= start < 24 and 0 <= end < 24):
-            raise ValueError('hours not in the range(0, 24)')
-        try:
-            if start <= end:
-                self.rush_hours = set(range(start, end + 1))
-            else:
-                self.rush_hours = set(range(start, 24)) | set(range(0, end + 1))
-        except TypeError:
-            raise TypeError('hour must be integer') from None
+            raise ValueError('hours not in range [0, 24)')
+        if start < end:
+            self._is_rush_hour = lambda x: start <= x < end
+        else:
+            self._is_rush_hour = lambda x: 0 <= x < end or start <= x < 24
         self._latch = asyncio.Semaphore(loop=loop)
         self._blocking = True
 
     async def wait(self):
         """Controls frequency."""
         if self._blocking:
-            hour = datetime.now(tz=self.tz).hour
-            interval = self.busy_interval if hour in self.rush_hours else self.interval
+            now = datetime.now(tz=self.tz)
+            hour = now.hour + now.minute / 60 + now.second / 3600
+            interval = self.busy_interval if self._is_rush_hour(hour) else self.interval
             if interval > 0:
                 _logger.debug('Controller blocking')
                 await self._latch.acquire()

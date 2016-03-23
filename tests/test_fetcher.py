@@ -5,6 +5,7 @@ import logging
 
 import dscraper
 from dscraper import fetcher
+from dscraper.fetcher import HOST_CID
 
 from .utils import Test, timer
 
@@ -58,7 +59,7 @@ class TestFetcher(Test):
         # '/-3.xml',
         '/-4.xml'
     ]
-    host = fetcher._HOST_CID
+    host = HOST_CID
     expected = None
 
     @classmethod
@@ -111,7 +112,7 @@ class TestFetcher(Test):
         futs = [get_all(coro) for coro in mycoros]
         self.run_compare_all(futs)
 
-    @unittest.skip('duplicated case')
+    # @unittest.skip('duplicated case')
     def test_get(self):
         uri = self.targets[0]
         self.run_compare(self.f.get, uri)
@@ -121,7 +122,7 @@ class TestFetcher(Test):
         for uri in self.targets:
             self.run_compare(self.f.get, uri)
 
-    @unittest.skip('duplicated case')
+    # @unittest.skip('duplicated case')
     def test_404(self):
         try:
             self.run_compare(self.f.get, self.bad_targets[1])
@@ -130,7 +131,7 @@ class TestFetcher(Test):
         else:
             self.fail('Exception is not thrown on fetching a 404 page')
 
-    @unittest.skip('duplicated case')
+    # @unittest.skip('duplicated case')
     def test_multiple_async_get(self):
         gets = [f.get for f in self.fs]
         self.run_multiple_compare(gets, self.targets)

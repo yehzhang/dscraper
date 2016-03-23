@@ -7,7 +7,6 @@ CREATE TABLE `chatmetadata` (
   `chat_id` int(10) unsigned NOT NULL COMMENT '主键',
   `chat_source` varchar(10) COLLATE utf8mb4_unicode_ci NOT NULL DEFAULT '' COMMENT 'unknown',
   `chat_max_limit` int(10) unsigned NOT NULL DEFAULT '0' COMMENT '最大弹幕数',
-  `chat_max_count` int(10) unsigned NOT NULL DEFAULT '0' COMMENT 'unknown',
   `chat_mission` varchar(100) COLLATE utf8mb4_unicode_ci NOT NULL DEFAULT '' COMMENT 'unknown',
   `chat_crawled_time` timestamp NOT NULL DEFAULT CURRENT_TIMESTAMP,
   `av_id` int(10) unsigned NOT NULL DEFAULT '0' COMMENT 'Aid',
@@ -30,6 +29,7 @@ CREATE TABLE `comments` (
   CONSTRAINT `cmt_foreign_cid` FOREIGN KEY (`chat_id`) REFERENCES `chatmetadata` (`chat_id`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
+-- TODO Maybe change to code comments?
 CREATE TABLE `specialcomments` (
   `cmt_id` bigint(10) unsigned NOT NULL COMMENT '在弹幕数据库中的Row ID，用于“历史弹幕”功能，有重复',
   `cmt_date` timestamp NOT NULL DEFAULT '1970-01-01 08:00:01' COMMENT '时间戳，mysql格式',

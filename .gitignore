@@ -1,5 +1,13 @@
-python3.5
 __pycache__
-notes
-*.pyc
+python3.5
+.pylintrc
+*.sublime-project
+*.sublime-workspace
+.gitignore
+
 resources
+comments
+notes
+Danmaku\ Crawler/log
+runner.py
+snippets/

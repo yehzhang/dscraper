@@ -1,16 +1,17 @@
 import logging
 import asyncio
+import datetime
+import time
 from collections import deque
 from collections import defaultdict
 
 from .exporter import FileExporter
 from .exceptions import Scavenger, NoMoreItems
 from .utils import Sluice
-from .company import CIDCompany, AIDCompany, CID, AID
+from .company import CidCompany, AidCompany, CID, AID
 
 _logger = logging.getLogger(__name__)
 
-# _cooldown_duration = 1 # TODO adjust according to polite time, not belong here
 # _fetcher = None
 
 # async def get(cid, timestamp=0, loop=None):
@@ -34,8 +35,7 @@ class Scraper:
 
     Controls the operation and communication among other modules.
     TODO add user interface during running using the curses library
-    TODO add start and end timestamp. If set, always merge files. Or split by natural Roll Date?
-    TODO max_workers = 3? how to control max workers across companies? <- class variable
+    TODO max_workers = 3? how to control maximum workers across companies? <- class variable
     """
     MAX_WORKERS = 24
 
@@ -75,18 +75,27 @@ class Scraper:
         self._iters[company_type].append(target_iter)
 
     def run(self):
+        start_time = time.time()
+        results = self._run()
+        end_time = time.time()
+
+        # Sum up the results
+        results.append('Duration: {}'.format(datetime.timedelta(seconds=end_time - start_time)))
+        _logger.info('Report\n======\n\n%s', '\n'.join(results))
+
+    def _run(self):
         scavenger = Scavenger()
         distributor = None
         exporter = self.exporter
         num_workers = self.num_workers
         companies = []
 
-        # TODO Build the AIDCompany
+        # TODO Build the AidCompany
         # aid_targets = self._iters[AID]
         # if aid_targets:
-        #     distributor = Distributor(self.loop)
+        #     distributor = BlockingDistributor(self.loop)
         #     distributor.set()
-        #     company = AIDCompany() # TODO
+        #     company = AidCompany() # TODO
         #     distributor = company
         #     aid_workers = min(round(num_workers / 3), 1)
         #     num_workers -= aid_workers
@@ -94,11 +103,11 @@ class Scraper:
         #     for target in self._iters[AID]:
         #         company.post(target)
 
-        # Build the CIDCompany
+        # Build the CidCompany
         if distributor is None:
-            # If there is no AIDCompany upstream, the CIDCompany needs an initial distributor
-            distributor = Distributor(loop=self.loop)
-        company = CIDCompany(distributor, history=self.history,
+            # If there is no AidCompany upstream, the CidCompany needs an initial distributor
+            distributor = BlockingDistributor(loop=self.loop)
+        company = CidCompany(distributor, history=self.history,
                              scavenger=scavenger, exporter=exporter,
                              loop=self.loop)
         company.hire(num_workers)
@@ -109,35 +118,37 @@ class Scraper:
 
         self.loop.run_until_complete(self.exporter.connect())
         asyncio.ensure_future(self._patrol())
-        results = self.loop.run_until_complete(asyncio.gather(*[com.run() for com in companies]))
-        self.loop.run_until_complete(self.exporter.disconnect())
-
-        # TODO sum up the results
-
+        try:
+            return self.loop.run_until_complete(asyncio.gather(*[com.run() for com in companies]))
+        finally:
+            self.loop.run_until_complete(self.exporter.disconnect())
 
     async def _patrol(self):
-        # TODO read from the command line and update states. stop the scraper by calling distributor.close
+        # TODO read from the command line and update states. stop the scraper by
+        # calling distributor.close
         pass
 
-class Distributor:
+
+class BlockingDistributor:
     """Distributes items from lists on demand. Support blocking when there is
     no items available.
     """
+
     def __init__(self, *, loop):
         self._queue = deque()
         self._iter = None
         self._latch = Sluice(loop=loop)
+        self._count = 0
         self.set = self._latch.set
         self.is_set = self._latch.is_set
 
     def post(self, it):
         """
-        :param iterator it:
+        :param iterable it:
         """
         if self.is_set():
             raise RuntimeError('distributor does not accept items anymore')
-        # TODO priority post
-        self._queue.append(it)
+        self._queue.append(iter(it))
         self._latch.leak()
 
     async def claim(self):
@@ -157,9 +168,15 @@ class Distributor:
                     await self._latch.wait()
                     continue
             try:
-                return next(self._iter)
+                item = next(self._iter)
             except StopIteration:
                 self._iter = None
+            else:
+                self._count += 1
+                return item
+
+    def stat(self):
+        return self._count
 
     def close(self):
         """Close this distributor."""

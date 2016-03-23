@@ -1,10 +1,7 @@
-# __all__ = ('DscraperError', 'HostError', 'ConnectTimeout',
-#            'ResponseError', 'DataError', 'DecodeError', 'ParseError',
-#            'InvalidCid', 'MultipleErrors', 'NoResponseReadError', 'PageNotFound')
-
 import logging
 
 _logger = logging.getLogger(__name__)
+
 
 class DscraperError(Exception):
     """A general error that Dscraper has nothing to do with it.
@@ -25,6 +22,7 @@ class DscraperError(Exception):
     def results_in(self, consequence):
         self.args = ('{}: {}'.format(consequence, self.args[0]), )
 
+
 class HostError(DscraperError, OSError):
     """An error occured while trying to communicate with the host.
     This error is most likely caused by the host. Some frequent causes are that
@@ -33,12 +31,15 @@ class HostError(DscraperError, OSError):
     """
     damage = 40
 
+
 class ConnectTimeout(HostError):
     """All attempts to connect to the host timed out."""
     level = logging.WARNING
 
+
 class ResponseError(HostError):
     """The response from the host was invalid."""
+
 
 class NoResponseReadError(ResponseError):
     """There is no response from the host.
@@ -46,6 +47,7 @@ class NoResponseReadError(ResponseError):
     so that the connection was closed. This exception occurs frequently.
     """
     damage = 10
+
 
 class DataError(DscraperError, ValueError):
     """The data read from the response was invalid.
@@ -56,23 +58,29 @@ class DataError(DscraperError, ValueError):
     """
     damage = 30
 
+
 class DecodeError(DataError):
     """The byte array cannot be decoded."""
     level = logging.WARNING
 
+
 class ParseError(DataError):
     """The string cannot be parsed as XML or JSON."""
+
 
 class ContentError(DataError):
     """The recieved XML data contains a single element with "error" as content."""
     damage = 5
 
+
 class PageNotFound(DscraperError):
     """The given uri ended in a 404 page, which is very likely to happen."""
     damage = 5
 
+
 class MultipleErrors(DscraperError):
     """The container of multiple errors."""
+
     def __init__(self, errors):
         super().__init__('')
         errors = set((type(e), e.args[0], e.damage) for e in errors)
@@ -81,8 +89,10 @@ class MultipleErrors(DscraperError):
         self.args = (message,)
         self.damage = max(damages)
 
+
 class NoMoreItems(DscraperError):
     """A replacement of StopIteration in coroutines. Internal use only."""
+
 
 class Scavenger:
     """Handles and logs all exceptions."""
@@ -94,6 +104,7 @@ class Scavenger:
         self.dead = False
         self._health = self._max_health = self._MAX_HEALTH
         self._recorders = 1
+        self._failures = []
 
     def set_recorders(self, num):
         _logger.debug('set %d recorders', num)
@@ -120,12 +131,16 @@ class Scavenger:
             self._health -= e.damage
         if self._health <= 0:
             self.dead = True
-        _logger.debug('health: %d / %d, recorders: %d', self._health, self._max_health, self._recorders)
+        self._failures.append(cid)
+        _logger.debug('health: %d / %d, recorders: %d', self._health,
+                      self._max_health, self._recorders)
 
     def is_dead(self):
         return self.dead
 
+    def stat(self):
+        return self._failures
+
     @staticmethod
     def capitalize(s):
         return s[0].upper() + s[1:]
-

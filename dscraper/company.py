@@ -11,12 +11,14 @@ _logger = logging.getLogger(__name__)
 AID = 'AID'
 CID = 'CID'
 
+
 class BaseCompany:
     """Controls the number and operation of workers under the same policy.
 
     Can be: distributor, scavenger
     """
-    def __init__(self, worker_ctor, *, scavenger=None, loop):
+
+    def __init__(self, worker_ctor, scavenger, *, loop):
         self.loop = loop
         self.scavenger = scavenger or Scavenger()
         self._closed = False
@@ -34,6 +36,7 @@ class BaseCompany:
         self.hire(self._intended_workers)
         del self._intended_workers
         await self._latch.wait()
+        return self.stat()
 
     def hire(self, num=1):
         if not self._running:
@@ -48,7 +51,7 @@ class BaseCompany:
         self.scavenger.set_recorders(len(self))
 
     def fire(self, num=1):
-        assert num <= len(self) # DEBUG
+        # assert num <= len(self)  # DEBUG
         num = min(len(self), num)
         for _ in range(num):
             worker, _ = self._workers.pop()
@@ -69,13 +72,18 @@ class BaseCompany:
     def __len__(self):
         return len(self._latch)
 
-class CIDCompany(BaseCompany):
+    def stat(self):
+        raise NotImplementedError
+
+
+class CidCompany(BaseCompany):
     """Taking charge of the CommentWorkers.
     """
+
     def __init__(self, distributor, *, scavenger=None, exporter=None, history=True, loop):
         ctor = lambda: CommentWorker(distributor=self, exporter=self.exporter,
                                      scavenger=self, history=history, loop=loop)
-        super().__init__(ctor, scavenger=scavenger, loop=loop)
+        super().__init__(ctor, scavenger, loop=loop)
         self.distributor = distributor
         self.exporter = exporter or FileExporter(loop=loop)
         self.post = distributor.post
@@ -100,12 +108,22 @@ class CIDCompany(BaseCompany):
         super().close()
         self.distributor.close()
 
-class AIDCompany(BaseCompany):
+    def stat(self):
+        stats = []
+        stats.append('Number of CIDs scraped: {}'.format(self.distributor.stat()))
+        failures = self.scavenger.stat()
+        stats.append('Exception(s) occured at: '.format(', '.join(failures))
+                     if failures else 'No exception occured!')
+        return '\n'.join(stats)
+
+
+class AidCompany(BaseCompany):
     """Taking charge of the AVWorkers.
 
     TODO hire and fire workers according to items in the queue
-    TODO set CIDCompany's distributor final when StopIteration
+    TODO set CidCompany's distributor final when StopIteration
     """
+
     def __init__(self, *, loop):
         raise NotImplementedError
 
@@ -116,6 +134,7 @@ class AIDCompany(BaseCompany):
     async def dump(self):
         # TODO through the dict from claim, and export cid as well aid
         raise NotImplementedError
+
 
 class BaseWorker:
 
@@ -153,6 +172,7 @@ class BaseWorker:
         """
         raise NotImplementedError
 
+
 class CommentWorker(BaseWorker):
     """Scrape all comments by CID
     """
@@ -160,10 +180,13 @@ class CommentWorker(BaseWorker):
     # TODO int is not enough for comment_id. use long instead!
 
     def __init__(self, *, distributor, scavenger, exporter, history, loop, start=None, end=None):
-        super().__init__(distributor=distributor, scavenger=scavenger, fetcher=CIDFetcher(loop=loop), exporter=exporter)
+        super().__init__(distributor=distributor, scavenger=scavenger,
+                         fetcher=CIDFetcher(loop=loop), exporter=exporter)
         self.start, self.end = start or 0, end or CommentFlow.MAX_TIMESTAMP
         self.history = history
         self._time_range = start is not None or end is not None
+        if self._time_range:
+            _logger.debug('time range is set')
 
     async def _next(self, cid):
         """Make a minimum number of requests to scrape all comments including history.
@@ -179,58 +202,52 @@ class CommentWorker(BaseWorker):
         # root is always scraped, regardless of ending timestamp. For complete header?
         # Must be parsed as XML for formatting
         latest = await self.fetcher.get_comments_root(cid)
+
+        # Check if there are history comments
+        history = False
         limit = self._find_int(latest, 'maxlimit', 1)
-        histories, pools, roll_dates = await self._scrape_history(cid, latest, limit)
-        flows = None
-        if histories:
-            # Join segments into flows
-            flows = [self._join(reversed(pool)) for pool in pools]
-            # If time range is set, the comments are not splitted
-            if self._time_range:
+        if self.history:
+            segments = self._digest(latest)
+            normal = segments[0]
+            if len(normal) >= limit:  # no less comments than a file could contain
+                first_date = normal[0].attrib['date']
+                ds = self._find_int(latest, 'ds', 0)  # ds may not be provided
+                start, end = max(self.start, ds), min(self.end, first_date)
+                if start <= end:  # not all comments are in time range
+                    history = True
+
+        if history:
+            pools = tuple([segment] for segment in segments)  # pool is a list of segments
+            histories, roll_dates = await self._scrape_history(cid, pools, limit, start, end)
+            flows = [self._join(reversed(pool)) for pool in pools]  # Join segments into flows
+            if self._time_range:  # If time range is set, the comments are not splitted
                 for flow in flows:
                     self._trim(flow, self.start, self.end)
                 roll_dates = None
-        flow = CommentFlow(latest, histories, flows, roll_dates, limit)
-        return flow
+        else:
+            histories = flows = roll_dates = None
+        return CommentFlow(latest, histories, flows, roll_dates, limit)
 
-    async def _scrape_history(self, cid, latest, limit):
+    async def _scrape_history(self, cid, pools, limit, start, end):
         """
-        :return histories, (normal_pool, protected_pool, title_pool, code_pool), roll_dates:
-            pool is a list of segments
+        :return histories, roll_dates:
         """
-        if not self.history:
-            return None, None, None
-        # Check if there are history comments
-        segments = self._digest(latest)
-        pools = tuple([segment] for segment in segments)
-        normal = segments[0]
-        if len(normal) < limit: # less comments than the file could contain
-            return None, None, None
-        first_date = normal[0].attrib['date']
-        ds = self._find_int(latest, 'ds', 0) # ds may not be provided
-        start, end = max(self.start, ds), min(self.end, first_date)
-        if start > end: # all comments are in time range already
-            return None, None, None
-        del normal, segments, first_date, ds
-
         _logger.debug('scraping cid: %d', cid)
         # Scrape the history, and append each comment into its pool (normal/protected)
         roll_dates = await self.fetcher.get_rolldate_json(cid)
-        _logger.debug('roll_dates:\n%s', roll_dates)
+        _logger.debug('roll_dates: %s', roll_dates)
         histories = {}
         for idate in range(len(roll_dates) - 1, -1, -1):
             if idate != 0:
                 if roll_dates[idate - 1] > end:
                     continue
-                elif roll_dates[idate] < start: # if idate == 0, assert roll_dates[idate] >= start
+                elif roll_dates[idate] < start:  # if idate == 0, assert roll_dates[idate] >= start
                     break
 
             date = roll_dates[idate]
             _logger.debug('scraping timestamp: %s', date)
             root = await self.fetcher.get_comments_root(cid, date)
             segments = self._digest(root)
-            if segments[1] or segments[2] or segments[3]:
-                _logger.debug('Special comments found at cid %d, %d', cid, date)
             for pool, segment in zip(pools, segments):
                 pool.append(segment)
             histories[date] = root
@@ -238,11 +255,11 @@ class CommentWorker(BaseWorker):
             normal = segments[0]
             if len(normal) < limit:
                 break
-            end = normal[0].attrib['date'] # assert len(normal) > 0 and date < end
+            end = normal[0].attrib['date']  # assert len(normal) > 0 and date < end
             if start > end:
                 break
 
-        return histories, pools, roll_dates
+        return histories, roll_dates
 
     @staticmethod
     def _find_int(root, tag, default):
@@ -259,6 +276,9 @@ class CommentWorker(BaseWorker):
         #       | Header             |
         #       +--------------------+
         #       | Normal comments    |
+        #       | ...                |
+        #       | ...                |
+        #       | ...                |
         #       | ...                |
         #       +--------------------+
         #       | Protected comments |
@@ -304,7 +324,7 @@ class CommentWorker(BaseWorker):
         last_id = CommentFlow.MAX_CMT_ID
         for i in range(irear - 1, -1, -1):
             cmt_id = cmts[i].attrib['id']
-            if cmt_id > last_id: # boundary found
+            if cmt_id > last_id:  # boundary found
                 ifront = i + 1
                 break
             last_id = cmt_id
@@ -314,11 +334,11 @@ class CommentWorker(BaseWorker):
         return normal, protected, title, code
 
     @staticmethod
-    def _join(segments):
+    def _join(pool):
         """Join a list of mostly ascending segments."""
         flow = []
         horizon = 0
-        for segment in segments:
+        for segment in pool:
             for i, cmt in enumerate(segment):
                 if cmt.attrib['id'] > horizon:
                     horizon = segment[-1].attrib['id']
@@ -328,9 +348,7 @@ class CommentWorker(BaseWorker):
 
     @staticmethod
     def _trim(flow, start, end):
-        """Discard all comments not in the time range [start, end]
-        Also join all segments into flows internally.
-        """
+        """Discard all comments whose dates are not in the range [start, end]"""
         if start > end:
             return
         length = len(flow)
@@ -343,4 +361,5 @@ class CommentWorker(BaseWorker):
             if cmt.attrib['date'] <= end:
                 irear = length - i
                 break
-        flow[:] = flow[ifront:irear]
+        if not (ifront == 0 and irear == length):
+            flow[:] = flow[ifront:irear]
