@@ -29,9 +29,9 @@ def parse_args():
                         default='file', choices=[FILE, STDOUT], help='how is data exported')
     parser.add_argument('-p', '--path', metavar='path', required=False,
                         default='./comments', help='where should files go if -e "file" was specified')
-    parser.add_argument('-m', '--merge', metavar='merge', required=False, type=bool, action='store_true'
-                        default=False, help='''whether merging comments of different dates as one
-                            file if -e "file" was specified''')
+    parser.add_argument('-m', '--merge', required=False, action='store_true', default=False,
+                        help='''whether merging comments of different dates as one file if
+                            -e "file" was specified''')
 
     parser.add_argument('--no-history', dest='history', action='store_false', default=True,
                         help='do not scrape history comments. Scrape latest comments only')

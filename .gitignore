@@ -6,8 +6,9 @@ python3.5
 .gitignore
 
 resources
-comments
+comments/
 notes
 Danmaku\ Crawler/log
 runner.py
 snippets/
+log/
