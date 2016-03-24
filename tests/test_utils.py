@@ -13,5 +13,5 @@ class TestUtils(unittest.TestCase):
     )
 
     def setUp(self):
-        raise NotImplementedError
+        pass
 

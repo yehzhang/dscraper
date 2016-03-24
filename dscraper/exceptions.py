@@ -75,7 +75,7 @@ class ContentError(DataError):
 
 class PageNotFound(DscraperError):
     """The given uri ended in a 404 page, which is very likely to happen."""
-    damage = 5
+    damage = 0
 
 
 class MultipleErrors(DscraperError):
@@ -104,6 +104,7 @@ class Scavenger:
         self.dead = False
         self._health = self._max_health = self._MAX_HEALTH
         self._recorders = 1
+        self._cnt_success = 0
         self._failures = []
 
     def set_recorders(self, num):
@@ -116,8 +117,9 @@ class Scavenger:
 
     def success(self):
         self._health = min(self._health + self._REGEN, self._max_health)
+        self._cnt_success += 1
 
-    def failure(self, worker, e):
+    def failure(self, worker, e=None):
         # TODO log worker type, change cid to aid or sth in logging
         cid = str(worker.item) if worker.item else 'not started yet'
         if e is None:
@@ -138,8 +140,11 @@ class Scavenger:
     def is_dead(self):
         return self.dead
 
-    def stat(self):
+    def get_failures(self):
         return self._failures
+
+    def get_success_count(self):
+        return self._cnt_success
 
     @staticmethod
     def capitalize(s):

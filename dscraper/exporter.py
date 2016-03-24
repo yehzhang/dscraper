@@ -12,9 +12,10 @@ class BaseExporter(AutoConnector):
 
     :param string fail_result: what would happen if connection to the destination timed out
     """
+    _CONNECT_TIMEOUT = 3.5
 
     def __init__(self, fail_result=None, *, loop):
-        super().__init__(_CONNECT_TIMEOUT, fail_result, loop=loop)
+        super().__init__(self._CONNECT_TIMEOUT, fail_result, loop=loop)
 
     async def dump(self, cid, flow, *, aid=None):
         """Export the data.
@@ -27,7 +28,6 @@ class BaseExporter(AutoConnector):
         """
         raise NotImplementedError
 
-_CONNECT_TIMEOUT = 3.5
 
 
 class StdoutExporter(BaseExporter):
@@ -43,15 +43,16 @@ class StdoutExporter(BaseExporter):
         pass
 
     async def dump(self, cid, flow, *, aid=None):
-        print('Comments from {}: \n'.format(cid))
-        print(FileExporter.tostring(flow.get_document()))
+        # TODO if aid, Comments from AID and CID
+        print('Comments from CID {}:'.format(cid))
+        print(FileExporter.tostring(flow.get_document() if flow.has_history() else
+                                    flow.get_latest()))
 
 
 class FileExporter(BaseExporter):
     """Save comments as XML files.
 
-    :param str path: path to put files. Default as 'comments/' under the current
-        working directory.
+    :param str path: path to put files. Default as './comments'.
     :param bool merge: whether save all comments in one file along with history,
         or keep them separate as the original form. Notice: if choose not to
         merge files, the resulting files could take huge space because of
@@ -61,25 +62,23 @@ class FileExporter(BaseExporter):
 
     def __init__(self, path=None, merge=False, *, loop):
         super().__init__('Failed to save as files', loop=loop)
-        if not path:
+        if path is None:
             path = self._OUT_DIR
-        self._wd = self._home = path
+        self._home = os.path.abspath(path)
+        self._cd()
         self._split = not merge
 
     async def dump(self, cid, flow, *, aid=None):
         # TODO if aid, dir: comments/av+aid/cid/*.xml
         self._cd()
         if not flow.has_history():
-            _logger.debug('No history at cid %s', str(cid))
             latest = flow.get_latest()
         elif flow.can_split() and self._split:
-            _logger.debug('History is splitted at cid %s', str(cid))
             self._cd(cid)
             for date, root in flow.get_histories():
                 self._write(root, '{date},{cid}.xml'.format(cid=cid, date=date))
             latest = flow.get_latest()
         else:
-            _logger.debug('History is merged at cid %s', str(cid))
             latest = flow.get_document()
         self._write(latest, '{cid}.xml'.format(cid=cid))
 
@@ -102,11 +101,9 @@ class FileExporter(BaseExporter):
         lines = ['<?xml version="1.0" encoding="UTF-8"?>\n<i>']
         for elem in elements:
             text = escape(elem.text) if elem.text else ''
-            if elem.tag == 'd':
-                line = '\t<d p="{attrs}">{text}</d>'.format(attrs=elem.attrib['p'], text=text)
-            else:
-                line = '\t<{tag}>{text}</{tag}>'.format(tag=elem.tag, text=text)
-            lines.append(line)
+            lines.append('\t<d p="{attrs}">{text}</d>'.format(attrs=elem.attrib['p'], text=text)
+                         if elem.tag == 'd' else
+                         '\t<{tag}>{text}</{tag}>'.format(tag=elem.tag, text=text))
         lines.append('</i>')
         return '\n'.join(lines)
 
@@ -122,6 +119,7 @@ class MysqlExporter(BaseExporter):
         # TODO wait until connect
         # if cmtdb is not created, create and set encoding
         # SET NAMES utf8mb4 COLLATE utf8mb4_unicode_ci;
+        raise NotImplementedError
 
     async def dump(self, cid, flow, *, aid=None):
         # TODO

@@ -27,7 +27,8 @@ class BaseFetcher:
     }
     # TODO: switch to backup headers if necessary. when neccessary?
     _BACKUP_HEADERS = {
-        'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_10_4) AppleWebKit/600.7.12 (KHTML, like Gecko) Version/8.0.7 Safari/600.7.12',
+        'User-Agent': '''Mozilla/5.0 (Macintosh; Intel Mac OS X 10_10_4) AppleWebKit/600.7.12
+            (KHTML, like Gecko) Version/8.0.7 Safari/600.7.12''',
         'Referer': 'http://www.baidu.com/',
         'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
         'Accept-Encoding': 'gzip, deflate',
@@ -83,7 +84,6 @@ class CIDFetcher(BaseFetcher):
     async def get_comments(self, cid, date=0):
         if date == 0:
             uri = self.CURRENT_URI.format(cid=cid)
-            # uri = CURRENT_COMMENTS_FILENAME.format(cid=cid)
         else:
             uri = self.HISTORY_URI.format(timestamp=date, cid=cid)
 
@@ -271,7 +271,8 @@ class Session(AutoConnector):
         if self._writer:
             await self.disconnect()
             _logger.debug('Trying to reconnect to the host')
-        self._reader, self._writer = await asyncio.open_connection(self.host, self.port, loop=self.loop)
+        self._reader, self._writer = await asyncio.open_connection(self.host, self.port,
+                                                                   loop=self.loop)
 
     async def disconnect(self):
         self._writer.close()

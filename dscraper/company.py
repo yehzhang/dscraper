@@ -2,7 +2,7 @@ import logging
 import asyncio
 
 from .fetcher import CIDFetcher
-from .utils import CountLatch, CommentFlow
+from .utils import CountLatch, CommentFlow, validate_id
 from .exporter import FileExporter
 from .exceptions import Scavenger, DscraperError, NoMoreItems
 
@@ -17,12 +17,12 @@ class BaseCompany:
 
     Can be: distributor, scavenger
     """
+    _num_workers = 0
 
     def __init__(self, worker_ctor, scavenger, *, loop):
         self.loop = loop
         self.scavenger = scavenger or Scavenger()
-        self._closed = False
-        self._running = False
+        self._running = self._closed = False
         self._intended_workers = 0
         self._ctor = worker_ctor
         self._workers = set()
@@ -45,32 +45,41 @@ class BaseCompany:
         for _ in range(num):
             worker = self._ctor()
             fut = asyncio.ensure_future(worker.run(), loop=self.loop)
-            fut.add_done_callback(lambda x: self._latch.count_down())
+            fut.add_done_callback(lambda x: self._on_fired(x.result()))
             self._workers.add(worker)
         self._latch.count(num)
-        self.scavenger.set_recorders(len(self))
+        self.scavenger.set_recorders(len(self._workers))
 
     def fire(self, num=1):
-        # assert num <= len(self)  # DEBUG
-        num = min(len(self), num)
-        for _ in range(num):
-            worker, _ = self._workers.pop()
-            worker.stop()
-        self.scavenger.set_recorders(len(self))
+        """Try to stop at most num running workers."""
+        if num < 0:
+            num = len(self._workers)
+        else:
+            num = min(len(self._workers), num)
+        for worker in self._workers:
+            if num <= 0:
+                break
+            if not worker.is_stopped():
+                worker.stop()  # Ask a worker to stop after completing its current task
+                num -= 1
 
-    def failure(self, worker, e):
+    def _on_fired(self, worker):
+        """The actual method to stop a worker."""
+        _logger.debug('A worker is done')
+        worker.stop()
+        self._latch.count_down()
+        self._workers.remove(worker)
+        self.scavenger.set_recorders(len(self._workers))
+
+    def failure(self, worker, e=None):
         self.scavenger.failure(worker, e)
         if self.scavenger.is_dead():
             _logger.critical('Company is down due to too many expections!')
             self.close()
-            # TODO also collect items yet to be scraped
 
     def close(self):
         self._closed = True
-        self.fire(len(self._workers))
-
-    def __len__(self):
-        return len(self._latch)
+        self.fire(-1)
 
     def stat(self):
         raise NotImplementedError
@@ -79,42 +88,69 @@ class BaseCompany:
 class CidCompany(BaseCompany):
     """Taking charge of the CommentWorkers.
     """
+    UPDATE_INTERVAL = 5 * 60
 
-    def __init__(self, distributor, *, scavenger=None, exporter=None, history=True, loop):
-        ctor = lambda: CommentWorker(distributor=self, exporter=self.exporter,
-                                     scavenger=self, history=history, loop=loop)
+    def __init__(self, distributor, *, scavenger=None, exporter=None, history=True, start=None,
+                 end=None, loop):
+        ctor = lambda: CommentWorker(distributor=self, exporter=self.exporter, scavenger=self,
+                                     history=history, start=start, end=end, loop=loop)
         super().__init__(ctor, scavenger, loop=loop)
         self.distributor = distributor
-        self.exporter = exporter or FileExporter(loop=loop)
         self.post = distributor.post
+        self.post_list = distributor.post_list
         self.set = distributor.set
+        self.exporter = exporter or FileExporter(loop=loop)
+        self._checkpoint = True
 
     async def claim(self):
+        # Update status
+        if self._checkpoint:
+            done = self.scavenger.get_success_count()
+            num_items = len(self.distributor)
+            if num_items is None:
+                _logger.info('Progress: %d', done)
+            else:
+                _logger.info('Progress: %d (%.1f%%)', done, done / num_items * 100)
+            self._checkpoint = False
+            self.loop.call_later(self.UPDATE_INTERVAL, self._enable_checkpoint)
+
         cid = await self.distributor.claim()
-        # Validate the item
-        try:
-            cid = int(cid)
-        except TypeError:
-            raise TypeError('invalid cid from input: an integer is required, not \'{}\''
-                            .format(type(cid).__name__)) from None
-        if cid <= 0:
-            raise ValueError('invalid cid from input: a positive integer is required, not \'{}\''
-                             .format(cid))
+        validate_id(cid)
         if self._closed:
             raise NoMoreItems('call it a day')
         return cid
 
-    def close(self):
-        super().close()
-        self.distributor.close()
-
     def stat(self):
-        stats = []
-        stats.append('Number of CIDs scraped: {}'.format(self.distributor.stat()))
-        failures = self.scavenger.stat()
-        stats.append('Exception(s) occured at: '.format(', '.join(failures))
-                     if failures else 'No exception occured!')
+        stats = ['-----', 'CID Scraping']
+
+        total = len(self.distributor)
+        cnt_success = self.scavenger.get_success_count()
+        failures = self.scavenger.get_failures()
+        items_rem = list(self.distributor.dump(1001))
+        cnt_items_rem = len(items_rem)
+
+        if total is None:
+            total = cnt_success + len(failures) + cnt_items_rem if cnt_items_rem < 1001 else 'unknown'
+        stats.append('Total number of targets: {}'.format(total))
+
+        stats.append('Number of targets scraped: {}'.format(cnt_success))
+
+        if failures:
+            stats.append('Exceptions occured at CID: {}'.format(', '.join(failures)))
+
+        if cnt_items_rem > 0:
+            srem = 'List of targets yet to be scraped at CID: {}'.format(', '.join(items_rem))
+            srem += '... (1000+ items)' if cnt_items_rem >= 1001 else \
+                ' ({} items in total)'.format(cnt_items_rem)
+        else:
+            srem = 'All targets are scraped successfully!' if cnt_success == total else \
+                'All targets are either scraped successfully or triggered exceptions'
+        stats.append(srem)
+
         return '\n'.join(stats)
+
+    def _enable_checkpoint(self):
+        self._checkpoint = True
 
 
 class AidCompany(BaseCompany):
@@ -146,25 +182,28 @@ class BaseWorker:
 
     async def run(self):
         async with self.fetcher:
-            while not self._stopped and not self.scavenger.is_dead():
-                # TODO update progress, already scraped, current scraping
+            while not self._stopped:
+                # TODO update progress, already scraped, current scraping <- in dtor.claim()?
                 try:
                     item = self.item = await self.distributor.claim()
                     data = await self._next(item)
                     await self.exporter.dump(item, data)
                 except NoMoreItems:
-                    self.stop()
                     break
                 except DscraperError as e:
                     self.scavenger.failure(self, e)
-                except:
-                    self.scavenger.failure(self, None)
+                except Exception:
+                    self.scavenger.failure(self)
                 else:
                     self.scavenger.success()
-        _logger.info('A worker is done')
+        return self
 
     def stop(self):
+        """Mostly called by company upon finishing. Worker does not call it itself."""
         self._stopped = True
+
+    def is_stopped(self):
+        return self._stopped
 
     async def _next(self, item):
         """
@@ -182,7 +221,8 @@ class CommentWorker(BaseWorker):
     def __init__(self, *, distributor, scavenger, exporter, history, loop, start=None, end=None):
         super().__init__(distributor=distributor, scavenger=scavenger,
                          fetcher=CIDFetcher(loop=loop), exporter=exporter)
-        self.start, self.end = start or 0, end or CommentFlow.MAX_TIMESTAMP
+        self.start = start if start is not None else 0
+        self.end = end if end is not None else CommentFlow.MAX_TIMESTAMP
         self.history = history
         self._time_range = start is not None or end is not None
         if self._time_range:

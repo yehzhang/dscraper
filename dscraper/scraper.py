@@ -2,12 +2,12 @@ import logging
 import asyncio
 import datetime
 import time
-from collections import deque
-from collections import defaultdict
+from collections import deque, defaultdict
+from itertools import chain, islice
 
 from .exporter import FileExporter
 from .exceptions import Scavenger, NoMoreItems
-from .utils import Sluice
+from .utils import Sluice, validate_id
 from .company import CidCompany, AidCompany, CID, AID
 
 _logger = logging.getLogger(__name__)
@@ -22,7 +22,7 @@ _logger = logging.getLogger(__name__)
 #     async with _fetcher:
 #         try:
 #             return await _fetcher.fetch_xml(cid, timestamp)
-#         except:
+#         except Exception:
 #             # TODO
 #             raise
 
@@ -38,22 +38,24 @@ class Scraper:
     TODO max_workers = 3? how to control maximum workers across companies? <- class variable
     """
     MAX_WORKERS = 24
+    _IND = 'individual'
 
-    def __init__(self, exporter=None, history=True, max_workers=6, *, loop=None):
+    def __init__(self, exporter=None, history=True, start=None, end=None, max_workers=6, *, loop=None):
         if not 0 < max_workers <= self.MAX_WORKERS:
             raise ValueError('number of workers is not in range [1, {}]'.format(self.MAX_WORKERS))
         self.loop = loop or asyncio.get_event_loop()
         self.exporter = exporter or FileExporter(loop=self.loop)
-        self.history = history
-        self.scavenger = Scavenger()
-        self.num_workers = max_workers
+        self.history, self.start, self.end = history, start, end
+        self.num_workers = max_workers  # Maybe unecessary since there is a class variable in class Company?
         self._iters = defaultdict(list)
 
     def add(self, target, company_type=CID):
         """
-        :param int target:
+        :param int target: a positive integer representing a CID or AID
         """
-        self.add_list([target], company_type)
+        validate_id(target)
+        self._iters[(company_type, self._IND)].append(target)
+        return self
 
     def add_range(self, start, end, company_type=CID):
         """Adds a range of targets, inclusive.
@@ -62,26 +64,36 @@ class Scraper:
         """
         if start <= 0 or end < start:
             raise ValueError('not a valid range: [{} - {}]'.format(start, end))
-        self.add_list(range(start, end + 1), company_type)
+        self._iters[company_type].append(range(start, end + 1))
+        return self
 
     def add_list(self, targets, company_type=CID):
         """
         :param iterable targets: an iterable of integers
+
+        Note: cannot do type or value checking here because targets might be an
+            iterator or infinite generator
         """
         try:
-            target_iter = iter(targets)
+            _ = iter(targets)
         except TypeError:
-            raise TypeError('target not iterable') from None
-        self._iters[company_type].append(target_iter)
+            raise TypeError('target \'{}\' not iterable'.format(targets)) from None
+        self._iters[company_type].append(targets)
+        return self
 
     def run(self):
         start_time = time.time()
-        results = self._run()
+        stats = self._run()
         end_time = time.time()
 
         # Sum up the results
-        results.append('Duration: {}'.format(datetime.timedelta(seconds=end_time - start_time)))
-        _logger.info('Report\n======\n\n%s', '\n'.join(results))
+        stats.insert(0, 'Report')
+        stats.append('-----')
+        stats.append('Overall')
+        stats.append('Finished in: {}'.format(
+            datetime.timedelta(seconds=round(end_time - start_time))))
+        stats.append('======\n')
+        _logger.info('\n'.join(stats))
 
     def _run(self):
         scavenger = Scavenger()
@@ -111,10 +123,14 @@ class Scraper:
                              scavenger=scavenger, exporter=exporter,
                              loop=self.loop)
         company.hire(num_workers)
-        for target in self._iters[CID]:
-            company.post(target)
+        targets = self._iters[CID]
+        targets.append(self._iters[(CID, self._IND)])
+        company.post_list(targets)
         company.set()
         companies.append(company)
+        del self.history, self.start, self.end, scavenger, distributor, exporter, num_workers, \
+            company, targets
+        self._iters.clear()
 
         self.loop.run_until_complete(self.exporter.connect())
         asyncio.ensure_future(self._patrol())
@@ -130,7 +146,7 @@ class Scraper:
 
 
 class BlockingDistributor:
-    """Distributes items from lists on demand. Support blocking when there is
+    """Distributes items from iterables on demand. Block when there is
     no items available.
     """
 
@@ -138,17 +154,36 @@ class BlockingDistributor:
         self._queue = deque()
         self._iter = None
         self._latch = Sluice(loop=loop)
-        self._count = 0
         self.set = self._latch.set
         self.is_set = self._latch.is_set
+        self._count = 0
 
     def post(self, it):
         """
-        :param iterable it:
+        :param iterable it: can be a list or generator
         """
         if self.is_set():
             raise RuntimeError('distributor does not accept items anymore')
+        if self._count is not None:
+            try:
+                self._count += len(it)
+            except TypeError:
+                self._count = None
         self._queue.append(iter(it))
+        self._latch.leak()
+
+    def post_list(self, its):
+        """
+        :param list its: a list of lists or generators
+        """
+        if self.is_set():
+            raise RuntimeError('distributor does not accept items anymore')
+        if self._count is not None:
+            try:
+                self._count += sum(map(len, its))
+            except TypeError:
+                self._count = None
+        self._queue.extend(map(iter, its))
         self._latch.leak()
 
     async def claim(self):
@@ -168,18 +203,22 @@ class BlockingDistributor:
                     await self._latch.wait()
                     continue
             try:
-                item = next(self._iter)
+                return next(self._iter)
             except StopIteration:
                 self._iter = None
-            else:
-                self._count += 1
-                return item
 
-    def stat(self):
-        return self._count
+    def dump(self, num=None):
+        """Remove all items yet to be distributed, and return at most num of them."""
+        iter_items = chain(self._iter or [], *self._queue)
+        self.clear()
+        if num is not None:
+            iter_items = islice(iter_items, num)
+        return iter_items
 
-    def close(self):
-        """Close this distributor."""
+    def clear(self):
+        """Remove all items yet to be distributed."""
         self._queue.clear()
         self._iter = None
-        self.set()
+
+    def __len__(self):
+        return self._count

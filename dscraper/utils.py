@@ -16,9 +16,11 @@ _logger = logging.getLogger(__name__)
 MAX_INT = 2147483647
 MAX_LONG = 9223372036854775807
 
+
 def decorator(d):
     return lambda f: update_wrapper(d(f), f)
 decorator = decorator(decorator)
+
 
 @decorator
 def trace(f):
@@ -53,6 +55,7 @@ INDENT = '   '
 FORMAT_IN = '{indent}{signature} -> #{tid}'
 FORMAT_OUT = '{indent}{result} <- #{tid}'
 
+
 @decorator
 def alock(coro):
     async def _coro(*args, **kwargs):
@@ -60,6 +63,18 @@ def alock(coro):
             return await coro(*args, **kwargs)
     lock = asyncio.Lock()
     return _coro
+
+
+def validate_id(target):
+    try:
+        if target <= 0:
+            raise ValueError(
+                'invalid target from input: a positive integer is required, not \'{}\''
+                .format(target))
+    except TypeError:
+        raise TypeError('invalid target from input: an integer is required, not \'{}\''
+                        .format(type(target).__name__)) from None
+
 
 def escape_invalid_xml_chars(text):
     return _PATTERN_ILL_XML_CHR.sub(_REPL_ILL_XML_CHR, text)
@@ -80,6 +95,7 @@ illegal_ranges = [r'{}-{}'.format(chr(low), chr(high)) for low, high in illegal_
 _PATTERN_ILL_XML_CHR = re.compile(r'[{}]'.format(r''.join(illegal_ranges)))
 _REPL_ILL_XML_CHR = lambda x: r'\x{:02X}'.format(ord(x.group(0)))
 del illegal_xml_chrs, illegal_ranges
+
 
 def parse_comments_xml(text):
     try:
@@ -108,6 +124,7 @@ def parse_comments_xml(text):
 
     return root
 
+
 def parse_rolldate_json(text):
     try:
         rd = json.loads(text)
@@ -119,6 +136,7 @@ def parse_rolldate_json(text):
     except KeyError:
         raise ContentError('content of the Roll Date is invalid') from None
 
+
 class CommentFlow:
     """Data container class. Keeps all comments in a flow and cuts a piece from it for export.
     """
@@ -128,7 +146,7 @@ class CommentFlow:
     _HISTORY_HEADERS = ('chatserver', 'chatid', 'mission', 'maxlimit')
 
     def __init__(self, latest, histories, flows, roll_dates, limit):
-        self.latest = latest # root element with children referenced in the flows.
+        self.latest = latest  # root element with children referenced in the flows.
         self._histories_roots = histories
         self.flows = flows
         self._splitter = roll_dates
@@ -141,7 +159,6 @@ class CommentFlow:
         return bool(self._histories_roots)
 
     def get_latest(self):
-        _logger.debug('get_latest')
         return self.latest
 
     def get_all_comments(self):
@@ -151,7 +168,6 @@ class CommentFlow:
 
         :return [Element]:
         """
-        _logger.debug('get_all_comments')
         return itertools.chain(*self.flows)
 
     def get_histories(self):
@@ -162,7 +178,6 @@ class CommentFlow:
 
         :yield (timestamp, [Elements]):
         """
-        _logger.debug('get_histories')
         if not self._histories_roots:
             raise RuntimeError('no history available')
         elif not self._splitter:
@@ -175,7 +190,8 @@ class CommentFlow:
 
         for date in self._splitter:
             root = self._histories_roots.get(date, None)
-            _logger.debug('histories, date: %d, %s', date, 'generated' if root is None else 'origin')
+            _logger.debug('histories, date: %d, %s', date,
+                          'generated' if root is None else 'origin')
             if root is None:
                 root = itertools.chain(header, *map(lambda x: x.send(date), growers))
             yield (date, root)
@@ -186,7 +202,6 @@ class CommentFlow:
 
         :return [Elements]:
         """
-        _logger.debug('get_document')
         header = self._get_header(self._ROOT_HEADERS)
         return itertools.chain(header, *self.flows)
 
@@ -217,6 +232,7 @@ class CommentFlow:
         while True:
             yield flow[-limit:]
 
+
 class AutoConnector:
 
     template = '{}'
@@ -231,7 +247,8 @@ class AutoConnector:
     async def connect(self):
         for tries in range(self.retries + 1):
             try:
-                return await asyncio.wait_for(self._open_connection(), self._timeout, loop=self.loop)
+                return await asyncio.wait_for(self._open_connection(), self._timeout,
+                                              loop=self.loop)
             except asyncio.TimeoutError:
                 await asyncio.sleep(tries ** 2)
         message = self.template.format('connection timed out')
@@ -242,6 +259,7 @@ class AutoConnector:
 
     async def _open_connection(self):
         raise NotImplementedError
+
 
 class CountLatch:
     """A CountLatch implementation.
@@ -304,12 +322,14 @@ class CountLatch:
         finally:
             self._waiters.remove(fut)
 
+
 class Sluice:
     """
     An Sluice manages a flag that can be set to true with the set() method and
     reset to false with the clear() method. The wait() method blocks until the
     flag is true or the leak() method is called. The flag is initially false.
     """
+
     def __init__(self, *, loop=None):
         self._waiters = deque()
         self._loop = loop or asyncio.get_event_loop()
@@ -362,6 +382,7 @@ class Sluice:
 TIME_CONFIG_CN = (0, 1, 18, 22.5, timezone('Asia/Shanghai'))
 TIME_CONFIG_US = (0, 1, 18, 22.5, timezone('America/Los_Angeles'))
 
+
 class FrequencyController:
     """
     Limits the frequency of coroutines running across.
@@ -374,6 +395,7 @@ class FrequencyController:
         tzinfo timezone: time zone where the host is
     """
     # TODO choose time config from the host's geolocation
+
     def __init__(self, time_config=TIME_CONFIG_CN, *, loop=None):
         self.loop = loop or asyncio.get_event_loop()
         self.interval, self.busy_interval, start, end, self.tz = time_config
@@ -410,6 +432,7 @@ class FrequencyController:
         if not self._blocking:
             self.loop.run_until_complete(self._latch.acquire())
             self._blocking = True
+
 
 class NullController:
 
