@@ -44,10 +44,10 @@ class StdoutExporter(BaseExporter):
 
     async def dump(self, cid, flow, *, aid=None):
         # TODO if aid, Comments from AID and CID
-        print('Comments from CID {}:'.format(cid))
+        # print('Comments from CID {}:'.format(cid))
         print(FileExporter.tostring(flow.get_document() if flow.has_history() else
                                     flow.get_latest()))
-
+        print()
 
 class FileExporter(BaseExporter):
     """Save comments as XML files.
