@@ -2,51 +2,74 @@ import logging
 import asyncio
 import datetime
 import time
+import io
 from collections import deque, defaultdict
 from itertools import chain, islice
 
-from .exporter import FileExporter
+from .exporter import FileExporter, StreamExporter
 from .exceptions import Scavenger, NoMoreItems
 from .utils import Sluice, validate_id
 from .company import CidCompany, AidCompany, CID, AID
 
 _logger = logging.getLogger(__name__)
 
-# _fetcher = None
+async def get(cid, history=True, *, loop=None):
+    """Get the XML string of all comments."""
+    return await _get('', 1, history, loop)
 
-# async def get(cid, timestamp=0, loop=None):
-#     global _fetcher
-#     if not _fetcher or loop:
-#         _fetcher = Fetcher(loop=loop)
+async def get_list(targets, history=True, *, loop=None):
+    """Get a list of XML strings of the targets."""
+    raise NotImplementedError
 
-#     async with _fetcher:
-#         try:
-#             return await _fetcher.fetch_xml(cid, timestamp)
-#         except Exception:
-#             # TODO
-#             raise
+    end = chr(0)
+    try:
+        num_workers = min(len(targets), 6)
+    except TypeError:
+        num_workers = 6
+    ltext = await _get(end, num_workers, history, loop).split(end)
+    ltext.pop()
 
-# async def scrape(mixed):
-#     pass
+    # TODO split result not sorted
+    return ltext
+
+async def _get(end, num_workers, history, loop):
+    if loop is None:
+        loop = asyncio.get_event_loop()
+    stream = io.StringIO()
+    exporter = StreamExporter(stream, end)
+    scraper = Scraper(history=history, max_workers=num_workers, loop=loop)
+
+    await scraper.async_run()
+
+    text = stream.getvalue()
+    stream.close()
+    return text
 
 
 class Scraper:
-    """The main class of dcraper.
+    """The main driver of dcraper. Controls the operation and communication among modules.
 
-    Controls the operation and communication among other modules.
+    :param exporter exporter: handler of data fetched
+    :param bool history: whether scrape history comments or not
+    :param (int, int) time_range: two unix timestamps specifying the beginning and ending
+        dates between which comments should be scraped (inclusive)
+    :param int max_workers: maximum number of workers (connections) to one host the scraper
+        could establish at the same time
+
     TODO add user interface during running using the curses library
     TODO max_workers = 3? how to control maximum workers across companies? <- class variable
     """
     MAX_WORKERS = 24
     _IND = 'individual'
 
-    def __init__(self, exporter=None, history=True, start=None, end=None, max_workers=6, *, loop=None):
+    def __init__(self, exporter=None, history=True, time_range=(None, None), max_workers=6, *,
+                 loop=None):
         if not 0 < max_workers <= self.MAX_WORKERS:
             raise ValueError('number of workers is not in range [1, {}]'.format(self.MAX_WORKERS))
         self.loop = loop or asyncio.get_event_loop()
         self.exporter = exporter or FileExporter(loop=self.loop)
-        self.history, self.start, self.end = history, start, end
-        self.num_workers = max_workers  # Maybe unecessary since there is a class variable in class Company?
+        self.history, self.time_range = history, time_range
+        self.max_workers = max_workers
         self._iters = defaultdict(list)
 
     def add(self, target, company_type=CID):
@@ -82,8 +105,13 @@ class Scraper:
         return self
 
     def run(self):
+        """Run the scraper."""
+        self.loop.run_until_complete(self.async_run())
+
+    async def async_run(self):
+        """The indeed main coroutine that can be awaited."""
         start_time = time.time()
-        stats = self._run()
+        stats = await self._async_run()
         end_time = time.time()
 
         # Sum up the results
@@ -95,11 +123,10 @@ class Scraper:
         stats.append('======\n')
         _logger.info('\n'.join(stats))
 
-    def _run(self):
+    async def _async_run(self):
         scavenger = Scavenger()
         distributor = None
         exporter = self.exporter
-        num_workers = self.num_workers
         companies = []
 
         # TODO Build the AidCompany
@@ -109,8 +136,6 @@ class Scraper:
         #     distributor.set()
         #     company = AidCompany() # TODO
         #     distributor = company
-        #     aid_workers = min(round(num_workers / 3), 1)
-        #     num_workers -= aid_workers
         #     companies.append(company)
         #     for target in self._iters[AID]:
         #         company.post(target)
@@ -119,25 +144,23 @@ class Scraper:
         if distributor is None:
             # If there is no AidCompany upstream, the CidCompany needs an initial distributor
             distributor = BlockingDistributor(loop=self.loop)
-        company = CidCompany(distributor, history=self.history,
-                             scavenger=scavenger, exporter=exporter,
-                             loop=self.loop)
-        company.hire(num_workers)
+        company = CidCompany(distributor, history=self.history, scavenger=scavenger,
+                             exporter=exporter, time_range=self.time_range, loop=self.loop)
+        company.hire(self.max_workers)
         targets = self._iters[CID]
         targets.append(self._iters[(CID, self._IND)])
         company.post_list(targets)
         company.set()
         companies.append(company)
-        del self.history, self.start, self.end, scavenger, distributor, exporter, num_workers, \
-            company, targets
+        del self.history, self.time_range, scavenger, distributor, exporter, company, targets
         self._iters.clear()
 
-        self.loop.run_until_complete(self.exporter.connect())
+        await self.exporter.connect()
         asyncio.ensure_future(self._patrol())
         try:
-            return self.loop.run_until_complete(asyncio.gather(*[com.run() for com in companies]))
+            return await asyncio.gather(*[com.run() for com in companies])
         finally:
-            self.loop.run_until_complete(self.exporter.disconnect())
+            await self.exporter.disconnect()
 
     async def _patrol(self):
         # TODO read from the command line and update states. stop the scraper by
@@ -220,5 +243,5 @@ class BlockingDistributor:
         self._queue.clear()
         self._iter = None
 
-    def __len__(self):
+    def get_total(self):
         return self._count

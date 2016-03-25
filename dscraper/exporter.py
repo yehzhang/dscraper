@@ -1,5 +1,7 @@
 import logging
 import os
+import sys
+from concurrent.futures import ThreadPoolExecutor
 from xml.sax.saxutils import escape
 
 from .utils import AutoConnector
@@ -29,12 +31,13 @@ class BaseExporter(AutoConnector):
         raise NotImplementedError
 
 
+class StreamExporter(BaseExporter):
+    """Write the output to a stream. The default stream is stdout."""
 
-class StdoutExporter(BaseExporter):
-    """Prints human-readable comment entries to stdout."""
-
-    def __init__(self, *, loop):
-        super().__init__('Failed to print to the console', loop=loop)
+    def __init__(self, stream=None, end='\n', *, loop):
+        super().__init__('Failed to write to the stream', loop=loop)
+        self.stream = sys.stdout if stream is None else stream
+        self.end = end
 
     async def _open_connection(self):
         pass
@@ -44,10 +47,20 @@ class StdoutExporter(BaseExporter):
 
     async def dump(self, cid, flow, *, aid=None):
         # TODO if aid, Comments from AID and CID
-        # print('Comments from CID {}:'.format(cid))
-        print(FileExporter.tostring(flow.get_document() if flow.has_history() else
-                                    flow.get_latest()))
-        print()
+        self.write(self.stream, flow.get_document() if flow.has_history() else flow.get_latest())
+        stream.write(self.end)
+
+    @staticmethod
+    def write(stream, elements):
+        stream.write('<?xml version="1.0" encoding="UTF-8"?>\n')
+        stream.write('<i>\n')
+        for elem in elements:
+            text = escape(elem.text) if elem.text else ''
+            stream.write('\t<d p="{attrs}">{text}</d>\n'.format(attrs=elem.attrib['p'], text=text)
+                         if elem.tag == 'd' else
+                         '\t<{tag}>{text}</{tag}>\n'.format(tag=elem.tag, text=text))
+        stream.write('</i>')
+
 
 class FileExporter(BaseExporter):
     """Save comments as XML files.
@@ -65,47 +78,41 @@ class FileExporter(BaseExporter):
         if path is None:
             path = self._OUT_DIR
         self._home = os.path.abspath(path)
-        self._cd()
         self._split = not merge
+        self._executor = ThreadPoolExecutor()
 
-    async def dump(self, cid, flow, *, aid=None):
+    async def dump(self, *args, **kwargs):
+        await self.loop.run_in_executor(self._executor, self._dump, *args, **kwargs)
+
+    def _dump(self, cid, flow, *, aid=None):
         # TODO if aid, dir: comments/av+aid/cid/*.xml
-        self._cd()
+        wd = self._cd()
         if not flow.has_history():
             latest = flow.get_latest()
         elif flow.can_split() and self._split:
-            self._cd(cid)
+            wd = self._cd(cid)
             for date, root in flow.get_histories():
-                self._write(root, '{date},{cid}.xml'.format(cid=cid, date=date))
+                self._write(root, wd, '{date},{cid}.xml'.format(cid=cid, date=date))
             latest = flow.get_latest()
         else:
             latest = flow.get_document()
-        self._write(latest, '{cid}.xml'.format(cid=cid))
+        self._write(latest, wd, '{cid}.xml'.format(cid=cid))
+
 
     async def _open_connection(self):
-        pass
+        self._cd()
+
+    async def disconnect(self):
+        self._executor.shutdown()
 
     def _cd(self, path=''):
         """Change working directory from home."""
-        path = os.path.join(self._home, str(path))
-        os.makedirs(path, exist_ok=True)
-        self._wd = path
+        return os.path.join(self._home, str(path))
 
-    # TODO performance if using run_in_executor?
-    def _write(self, elements, filename):
-        with open(os.path.join(self._wd, filename), 'w') as fout:
-            fout.write(self.tostring(elements))
-
-    @staticmethod
-    def tostring(elements):
-        lines = ['<?xml version="1.0" encoding="UTF-8"?>\n<i>']
-        for elem in elements:
-            text = escape(elem.text) if elem.text else ''
-            lines.append('\t<d p="{attrs}">{text}</d>'.format(attrs=elem.attrib['p'], text=text)
-                         if elem.tag == 'd' else
-                         '\t<{tag}>{text}</{tag}>'.format(tag=elem.tag, text=text))
-        lines.append('</i>')
-        return '\n'.join(lines)
+    def _write(self, elements, wd, filename):
+        os.makedirs(wd, exist_ok=True)
+        with open(os.path.join(wd, filename), 'w') as fout:
+            StreamExporter.write(fout, elements)
 
 
 class MysqlExporter(BaseExporter):
@@ -138,6 +145,7 @@ class SqliteExporter(BaseExporter):
 
     def __init__(self, *, loop):
         super().__init__('Failed to insert into the database', loop=loop)
+        raise NotImplementedError
 
     async def dump(self, cid, flow, *, aid=None):
         pass
@@ -147,3 +155,9 @@ class SqliteExporter(BaseExporter):
 
     async def disconnect(self):
         pass
+
+
+class MemoryExporter(BaseExporter):
+
+    def __init__(self):
+        raise NotImplementedError

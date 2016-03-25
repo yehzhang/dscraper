@@ -36,6 +36,8 @@ class ConnectTimeout(HostError):
     """All attempts to connect to the host timed out."""
     level = logging.WARNING
 
+class ReadTimeout(HostError):
+    """Attempt to read from the host timed out."""
 
 class ResponseError(HostError):
     """The response from the host was invalid."""
@@ -121,19 +123,23 @@ class Scavenger:
 
     def failure(self, worker, e=None):
         # TODO log worker type, change cid to aid or sth in logging
-        cid = str(worker.item) if worker.item else 'not started yet'
+        cid = str(worker.item) if worker.item else '\'not started yet\''
         if e is None:
-            _logger.exception('Unexpected exception occured when scraping cid %s', cid)
+            _logger.exception('Unexpected exception occured during scraping cid %s', cid)
             self._health -= self._UNEXPECTED_DAMAGE
         else:
-            message = '{} at cid {}'.format(self.capitalize(e.args[0]), cid)
+            message = '{} at CID {}'.format(self.capitalize(e.args[0]), cid)
             if e.__cause__:
                 message += ': ' + e.__cause__
             _logger.log(e.level, message)
             self._health -= e.damage
         if self._health <= 0:
+            _logger.critical('Too many exceptions triggered. The scraper is about to stop')
             self.dead = True
-        self._failures.append(cid)
+        if isinstance(e, PageNotFound):
+            self._cnt_success += 1
+        else:
+            self._failures.append(cid)
         _logger.debug('health: %d / %d, recorders: %d', self._health,
                       self._max_health, self._recorders)
 

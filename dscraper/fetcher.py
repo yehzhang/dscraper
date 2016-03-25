@@ -6,7 +6,7 @@ import zlib
 
 from .utils import (FrequencyController, AutoConnector, parse_comments_xml,
                     parse_rolldate_json, escape_invalid_xml_chars)
-from .exceptions import (HostError, ConnectTimeout, ResponseError, MultipleErrors,
+from .exceptions import (HostError, ConnectTimeout, ReadTimeout, ResponseError, MultipleErrors,
                          NoResponseReadError, PageNotFound, DecodeError)
 from . import __version__
 
@@ -170,27 +170,28 @@ class Session(AutoConnector):
                     if len(set(map(type, errors))) == 1:
                         raise
                     else:
-                        break
+                        raise MultipleErrors(errors) from None
                 await asyncio.sleep(retries ** 2)
                 await self.connect()
                 retries += 1
             else:
-                # check the status code
-                if self._get_status_code(headers) == 404:
-                    raise PageNotFound('{} is a 404 page'.format(uri))
-                # inflate and decode the body
-                return self._inflate_and_decode(body)
-        raise MultipleErrors(errors)
+                break
+
+        # check the status code
+        if self._get_status_code(headers) == 404:
+            raise PageNotFound('404 page')
+
+        return self._inflate_and_decode(body)
 
     async def _get(self, request):
-        # send the request
+        # send the request and read the response
         self._writer.write(request)
         try:
             await self._writer.drain()
+            response = await self._read()
         except ConnectionError as e:
-            raise HostError('connection to the host was reset') from e
-        # read the response
-        response = await self._read()
+            raise HostError('connection to the host was broken') from e
+
         if not response:
             _logger.debug('no response from the host on %s', request)
             raise NoResponseReadError('no response from the host')
@@ -203,16 +204,20 @@ class Session(AutoConnector):
         return headers, body
 
     async def _read(self):
+        # TODO Still get frozen upon reading a 404 page
         response = b''
         content_length = is_chunked = None
 
         while True:
-            task = self._reader.read(16384)
+            coro_read = self._reader.read(16384)
             # Time out if the server has not issued a response for read_timeout seconds
             if not response:
-                chunk = await asyncio.wait_for(task, self.read_timeout, loop=self.loop)
+                try:
+                    chunk = await asyncio.wait_for(coro_read, self.read_timeout, loop=self.loop)
+                except asyncio.TimeoutError:
+                    raise ReadTimeout('read nothing from the host before timeout') from None
             else:
-                chunk = await task
+                chunk = await coro_read
             # Which means the response contains no end-of-response information
             if not chunk:
                 break

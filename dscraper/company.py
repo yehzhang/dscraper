@@ -1,5 +1,7 @@
 import logging
 import asyncio
+import time
+import datetime
 
 from .fetcher import CIDFetcher
 from .utils import CountLatch, CommentFlow, validate_id
@@ -15,26 +17,22 @@ CID = 'CID'
 class BaseCompany:
     """Controls the number and operation of workers under the same policy.
 
-    Can be: distributor, scavenger
+    Can be: distributor
     """
-    _num_workers = 0
 
     def __init__(self, worker_ctor, scavenger, *, loop):
         self.loop = loop
-        self.scavenger = scavenger or Scavenger()
+        self.scavenger = scavenger
         self._running = self._closed = False
         self._intended_workers = 0
         self._ctor = worker_ctor
         self._workers = set()
         self._latch = CountLatch(loop=self.loop)
-        # Export methods
-        self.success = self.scavenger.success
-        self.is_dead = self.scavenger.is_dead
 
     async def run(self):
         self._running = True
         self.hire(self._intended_workers)
-        del self._intended_workers
+        self._intended_workers = 0
         await self._latch.wait()
         return self.stat()
 
@@ -66,16 +64,9 @@ class BaseCompany:
     def _on_fired(self, worker):
         """The actual method to stop a worker."""
         _logger.debug('A worker is done')
-        worker.stop()
-        self._latch.count_down()
         self._workers.remove(worker)
+        self._latch.count_down()
         self.scavenger.set_recorders(len(self._workers))
-
-    def failure(self, worker, e=None):
-        self.scavenger.failure(worker, e)
-        if self.scavenger.is_dead():
-            _logger.critical('Company is down due to too many expections!')
-            self.close()
 
     def close(self):
         self._closed = True
@@ -88,12 +79,11 @@ class BaseCompany:
 class CidCompany(BaseCompany):
     """Taking charge of the CommentWorkers.
     """
-    UPDATE_INTERVAL = 5 * 60
+    UPDATE_INTERVAL = 1 * 60
 
-    def __init__(self, distributor, *, scavenger=None, exporter=None, history=True, start=None,
-                 end=None, loop):
-        ctor = lambda: CommentWorker(distributor=self, exporter=self.exporter, scavenger=self,
-                                     history=history, start=start, end=end, loop=loop)
+    def __init__(self, distributor, *, scavenger, exporter, history, time_range, loop):
+        ctor = lambda: CommentWorker(distributor=self, exporter=self.exporter, scavenger=scavenger,
+                                     history=history, time_range=time_range, loop=loop)
         super().__init__(ctor, scavenger, loop=loop)
         self.distributor = distributor
         self.post = distributor.post
@@ -101,16 +91,18 @@ class CidCompany(BaseCompany):
         self.set = distributor.set
         self.exporter = exporter or FileExporter(loop=loop)
         self._checkpoint = True
+        self._t_start = time.time()
 
     async def claim(self):
         # Update status
         if self._checkpoint:
             done = self.scavenger.get_success_count()
-            num_items = len(self.distributor)
+            num_items = self.distributor.get_total()
+            elapsed = datetime.timedelta(seconds=round(time.time() - self._t_start))
             if num_items is None:
-                _logger.info('Progress: %d', done)
+                _logger.info('Progress: %d finished (time elapsed: %s)', done, elapsed)
             else:
-                _logger.info('Progress: %d (%.1f%%)', done, done / num_items * 100)
+                _logger.info('Progress: %.1f%% (%d finished, time elapsed: %s)', done / num_items * 100, done, elapsed)
             self._checkpoint = False
             self.loop.call_later(self.UPDATE_INTERVAL, self._enable_checkpoint)
 
@@ -123,14 +115,15 @@ class CidCompany(BaseCompany):
     def stat(self):
         stats = ['-----', 'CID Scraping']
 
-        total = len(self.distributor)
+        total = self.distributor.get_total()
         cnt_success = self.scavenger.get_success_count()
         failures = self.scavenger.get_failures()
         items_rem = list(self.distributor.dump(1001))
         cnt_items_rem = len(items_rem)
 
         if total is None:
-            total = cnt_success + len(failures) + cnt_items_rem if cnt_items_rem < 1001 else 'unknown'
+            total = cnt_success + len(failures) + \
+                cnt_items_rem if cnt_items_rem < 1001 else 'unknown'
         stats.append('Total number of targets: {}'.format(total))
 
         stats.append('Number of targets scraped: {}'.format(cnt_success))
@@ -144,7 +137,7 @@ class CidCompany(BaseCompany):
                 ' ({} items in total)'.format(cnt_items_rem)
         else:
             srem = 'All targets are scraped successfully!' if cnt_success == total else \
-                'All targets are either scraped successfully or triggered exceptions'
+                'All targets are either scraped successfully or skipped due to exceptions'
         stats.append(srem)
 
         return '\n'.join(stats)
@@ -182,8 +175,7 @@ class BaseWorker:
 
     async def run(self):
         async with self.fetcher:
-            while not self._stopped:
-                # TODO update progress, already scraped, current scraping <- in dtor.claim()?
+            while not self._stopped and not self.scavenger.is_dead():
                 try:
                     item = self.item = await self.distributor.claim()
                     data = await self._next(item)
@@ -196,6 +188,7 @@ class BaseWorker:
                     self.scavenger.failure(self)
                 else:
                     self.scavenger.success()
+        self.stop()
         return self
 
     def stop(self):
@@ -215,12 +208,12 @@ class BaseWorker:
 class CommentWorker(BaseWorker):
     """Scrape all comments by CID
     """
-    # note: elements returned may not be sorted, for example /12.xml
-    # TODO int is not enough for comment_id. use long instead!
+    # note: elements returned may not be sorted or in bad format like /12.xml
 
-    def __init__(self, *, distributor, scavenger, exporter, history, loop, start=None, end=None):
+    def __init__(self, *, distributor, scavenger, exporter, history, loop, time_range):
         super().__init__(distributor=distributor, scavenger=scavenger,
                          fetcher=CIDFetcher(loop=loop), exporter=exporter)
+        start, end = time_range
         self.start = start if start is not None else 0
         self.end = end if end is not None else CommentFlow.MAX_TIMESTAMP
         self.history = history

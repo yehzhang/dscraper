@@ -18,8 +18,8 @@ import sys
 assert sys.version_info >= (3, 5)
 
 from .exceptions import HostError, DecodeError, PageNotFound
-from .scraper import Scraper
-from .exporter import StdoutExporter, FileExporter, MysqlExporter, SqliteExporter
+from .scraper import Scraper, get
+from .exporter import StreamExporter, FileExporter# , MysqlExporter, SqliteExporter
 
 import logging
 logging.getLogger(__name__).addHandler(logging.NullHandler())

@@ -237,7 +237,7 @@ class TestCommentWorker(Test):
         self.etor = DummyExporter()
         self.sger = DummyScavenger()
         self.worker = CommentWorker(distributor=self.dtor, scavenger=self.sger, exporter=self.etor,
-                                    history=True, loop=self.loop, start=None, end=None)
+                                    history=True, loop=self.loop, time_range=(None, None))
         self.worker.fetcher = self.fcer = DummyFetcher()
 
     def test_general(self):
