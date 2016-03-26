@@ -16,7 +16,7 @@ class BaseExporter(AutoConnector):
     """
     _CONNECT_TIMEOUT = 3.5
 
-    def __init__(self, fail_result=None, *, loop):
+    def __init__(self, fail_result=None, *, loop=None):
         super().__init__(self._CONNECT_TIMEOUT, fail_result, loop=loop)
 
     async def dump(self, cid, flow, *, aid=None):
@@ -34,7 +34,7 @@ class BaseExporter(AutoConnector):
 class StreamExporter(BaseExporter):
     """Write the output to a stream. The default stream is stdout."""
 
-    def __init__(self, stream=None, end='\n', *, loop):
+    def __init__(self, stream=None, end='\n', *, loop=None):
         super().__init__('Failed to write to the stream', loop=loop)
         self.stream = sys.stdout if stream is None else stream
         self.end = end
@@ -73,16 +73,19 @@ class FileExporter(BaseExporter):
     """
     _OUT_DIR = 'comments'
 
-    def __init__(self, path=None, merge=False, *, loop):
+    def __init__(self, path=None, merge=False, *, loop=None):
         super().__init__('Failed to save as files', loop=loop)
         if path is None:
             path = self._OUT_DIR
         self._home = os.path.abspath(path)
         self._split = not merge
-        self._executor = ThreadPoolExecutor()
+        self._executor = None
 
     async def dump(self, *args, **kwargs):
-        await self.loop.run_in_executor(self._executor, self._dump, *args, **kwargs)
+        try:
+            await self.loop.run_in_executor(self._executor, self._dump, *args, **kwargs)
+        except AttributeError:
+            raise RuntimeError('FileExporter is not connected yet') from None
 
     def _dump(self, cid, flow, *, aid=None):
         # TODO if aid, dir: comments/av+aid/cid/*.xml
@@ -100,7 +103,9 @@ class FileExporter(BaseExporter):
 
 
     async def _open_connection(self):
-        self._cd()
+        wd = self._cd()
+        os.makedirs(wd, exist_ok=True)
+        self._executor = ThreadPoolExecutor()
 
     async def disconnect(self):
         self._executor.shutdown()
@@ -121,7 +126,7 @@ class MysqlExporter(BaseExporter):
         switch to a new table the current one contains to many rows
     """
 
-    def __init__(self, *, loop):
+    def __init__(self, *, loop=None):
         super().__init__('Failed to insert into the database', loop=loop)
         # TODO wait until connect
         # if cmtdb is not created, create and set encoding
@@ -143,7 +148,7 @@ class MysqlExporter(BaseExporter):
 
 class SqliteExporter(BaseExporter):
 
-    def __init__(self, *, loop):
+    def __init__(self, *, loop=None):
         super().__init__('Failed to insert into the database', loop=loop)
         raise NotImplementedError
 
@@ -159,5 +164,5 @@ class SqliteExporter(BaseExporter):
 
 class MemoryExporter(BaseExporter):
 
-    def __init__(self):
+    def __init__(self, *, loop=None):
         raise NotImplementedError

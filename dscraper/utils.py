@@ -125,6 +125,19 @@ def parse_comments_xml(text):
     return root
 
 
+def find_elems(elements, targets):
+    """Return a list of elements in a XML.
+
+    :return [Element]:
+    """
+    header = []
+    for k in targets:
+        elem = elements.find(k)
+        if elem is not None:
+            header.append(elem)
+    return header
+
+
 def parse_rolldate_json(text):
     try:
         rd = json.loads(text)
@@ -142,8 +155,8 @@ class CommentFlow:
     """
     MAX_TIMESTAMP = MAX_INT
     MAX_CMT_ID = MAX_LONG
-    _ROOT_HEADERS = ('chatserver', 'chatid', 'mission', 'maxlimit', 'source')
-    _HISTORY_HEADERS = ('chatserver', 'chatid', 'mission', 'maxlimit')
+    ROOT_HEADERS = ('chatserver', 'chatid', 'mission', 'maxlimit', 'source')
+    HISTORY_HEADERS = ('chatserver', 'chatid', 'mission', 'maxlimit')
 
     def __init__(self, latest, histories, flows, roll_dates, limit):
         self.latest = latest  # root element with children referenced in the flows.
@@ -159,6 +172,13 @@ class CommentFlow:
         return bool(self._histories_roots)
 
     def get_latest(self):
+        """Return a list of metadata Elements and of comment Elements of the latest
+        page (/[cid].xml).
+        Mostly called by database exporters, which require pure data and do not
+        care about what form it is.
+
+        :return [Elements]:
+        """
         return self.latest
 
     def get_all_comments(self):
@@ -166,13 +186,15 @@ class CommentFlow:
         Mostly called by database exporters, which require pure data and do not
         care about what form it is.
 
-        :return [Element]:
+        :return [Elements]:
         """
         return itertools.chain(*self.flows)
 
     def get_histories(self):
-        """Yields a list of Elements included in a comment document for each of
-        the timestamps in the Roll Dates.
+        """Yields a list of metadata Elements and of comment Elements for each of
+        the timestamps in the Roll Dates (splitter). Raises a RuntimeError if there
+        is no history or time range was set. Call get_document(), get_all_comments(),
+        or get_latest() instead().
         Mostly called by file exporters, which require comments splitted by Roll
         Dates.
 
@@ -183,7 +205,7 @@ class CommentFlow:
         elif not self._splitter:
             raise RuntimeError('no splitter available')
 
-        header = self._get_header(self._HISTORY_HEADERS)
+        header = find_elems(self.latest, self.HISTORY_HEADERS)
         growers = [self._grow(flow, self.limit) for flow in self.flows]
         for grower in growers:
             grower.send(None)
@@ -202,22 +224,8 @@ class CommentFlow:
 
         :return [Elements]:
         """
-        header = self._get_header(self._ROOT_HEADERS)
+        header = find_elems(self.latest, self.ROOT_HEADERS)
         return itertools.chain(header, *self.flows)
-
-    def _get_header(self, header_type):
-        """Return a list of metadata Elements.
-
-        :return [Element]:
-        """
-        header = []
-        for k in header_type:
-            elem = self.latest.find(k)
-            if elem is not None:
-                header.append(elem)
-            else:
-                _logger.debug('metadata \"%s\" missing', k)
-        return header
 
     @staticmethod
     def _grow(flow, limit):
@@ -237,9 +245,9 @@ class AutoConnector:
 
     template = '{}'
 
-    def __init__(self, timeout, fail_message=None, retries=2, *, loop):
+    def __init__(self, timeout, fail_message=None, retries=2, *, loop=None):
         self._timeout = timeout
-        self.loop = loop
+        self.loop = loop or asyncio.get_event_loop()
         self.retries = retries
         if fail_message:
             self.template = fail_message + ': ' + self.template
@@ -338,10 +346,9 @@ class Sluice:
     def leak(self):
         """Awakes all coroutines waiting for it. Does not set the internal flag.
         """
-        if not self._value:
-            for fut in self._waiters:
-                if not fut.done():
-                    fut.set_result(True)
+        for fut in self._waiters:
+            if not fut.done():
+                fut.set_result(True)
 
     def set(self):
         """Set the internal flag to true. All coroutines waiting for it to
@@ -411,15 +418,17 @@ class FrequencyController:
     async def wait(self):
         """Controls frequency."""
         if self._blocking:
-            now = datetime.now(tz=self.tz)
-            hour = now.hour + now.minute / 60 + now.second / 3600
-            interval = self.busy_interval if self._is_rush_hour(hour) else self.interval
+            interval = self.busy_interval if self.is_busy() else self.interval
             if interval > 0:
-                _logger.debug('Controller blocking')
                 await self._latch.acquire()
                 self.loop.call_later(interval, self._latch.release)
                 return True
         return False
+
+    def is_busy(self):
+        now = datetime.now(tz=self.tz)
+        hour = now.hour + now.minute / 60 + now.second / 3600
+        return self._is_rush_hour(hour)
 
     def free(self):
         """Stop blocking coroutines."""

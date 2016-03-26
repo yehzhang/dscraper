@@ -134,7 +134,8 @@ class Scavenger:
             _logger.log(e.level, message)
             self._health -= e.damage
         if self._health <= 0:
-            _logger.critical('Too many exceptions triggered. The scraper is about to stop')
+            if not self.dead:
+                _logger.critical('Too many exceptions triggered. The scraper is about to stop')
             self.dead = True
         if isinstance(e, PageNotFound):
             self._cnt_success += 1

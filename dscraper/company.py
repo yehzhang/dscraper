@@ -4,7 +4,7 @@ import time
 import datetime
 
 from .fetcher import CIDFetcher
-from .utils import CountLatch, CommentFlow, validate_id
+from .utils import CountLatch, CommentFlow, validate_id, FrequencyController, find_elems
 from .exporter import FileExporter
 from .exceptions import Scavenger, DscraperError, NoMoreItems
 
@@ -63,7 +63,7 @@ class BaseCompany:
 
     def _on_fired(self, worker):
         """The actual method to stop a worker."""
-        _logger.debug('A worker is done')
+        _logger.debug('A worker is done %s', worker)
         self._workers.remove(worker)
         self._latch.count_down()
         self.scavenger.set_recorders(len(self._workers))
@@ -82,35 +82,56 @@ class CidCompany(BaseCompany):
     UPDATE_INTERVAL = 1 * 60
 
     def __init__(self, distributor, *, scavenger, exporter, history, time_range, loop):
-        ctor = lambda: CommentWorker(distributor=self, exporter=self.exporter, scavenger=scavenger,
+        ctor = lambda: CommentWorker(distributor=self, exporter=exporter, scavenger=scavenger,
                                      history=history, time_range=time_range, loop=loop)
         super().__init__(ctor, scavenger, loop=loop)
         self.distributor = distributor
         self.post = distributor.post
         self.post_list = distributor.post_list
         self.set = distributor.set
-        self.exporter = exporter or FileExporter(loop=loop)
+        self.get_total = distributor.get_total
+        self.exporter = FileExporter(loop=loop)
         self._checkpoint = True
         self._t_start = time.time()
+        self._controller = FrequencyController()
 
     async def claim(self):
-        # Update status
+        # Update status for every a few minutes
         if self._checkpoint:
-            done = self.scavenger.get_success_count()
-            num_items = self.distributor.get_total()
-            elapsed = datetime.timedelta(seconds=round(time.time() - self._t_start))
-            if num_items is None:
-                _logger.info('Progress: %d finished (time elapsed: %s)', done, elapsed)
-            else:
-                _logger.info('Progress: %.1f%% (%d finished, time elapsed: %s)', done / num_items * 100, done, elapsed)
+            self._update()
             self._checkpoint = False
             self.loop.call_later(self.UPDATE_INTERVAL, self._enable_checkpoint)
 
+        # Claim an item
         cid = await self.distributor.claim()
         validate_id(cid)
+
+        # Wait for the controller
+        await self._controller.wait()
+
         if self._closed:
             raise NoMoreItems('call it a day')
         return cid
+
+    def _update(self):
+        # Log current status
+        done = self.scavenger.get_success_count()
+        num_items = self.distributor.get_total()
+        elapsed = datetime.timedelta(seconds=round(time.time() - self._t_start))
+        if num_items is None:
+            _logger.info('Progress: %d finished (time elapsed: %s)', done, elapsed)
+        else:
+            _logger.info('Progress: %.1f%% (%d finished, time elapsed: %s)', done / num_items * 100, done, elapsed)
+
+        # Check host's status
+        # TODO adjust workers in a more flexible way
+        len_worker = len(self._workers)
+        if self._controller.is_busy():
+            if len_worker > 3:
+                self.fire(len_worker - 3)
+        else:
+            if len_worker < 6:
+                self.hire(6 - len_worker)
 
     def stat(self):
         stats = ['-----', 'CID Scraping']
@@ -118,8 +139,8 @@ class CidCompany(BaseCompany):
         total = self.distributor.get_total()
         cnt_success = self.scavenger.get_success_count()
         failures = self.scavenger.get_failures()
-        items_rem = list(self.distributor.dump(1001))
-        cnt_items_rem = len(items_rem)
+        items_rem = list(self.distributor.dump(1001))  # TODO use repr istead
+        cnt_items_rem = len(items_rem)  # TODO total - succ - fail if possible
 
         if total is None:
             total = cnt_success + len(failures) + \
@@ -168,6 +189,7 @@ class AidCompany(BaseCompany):
 class BaseWorker:
 
     def __init__(self, *, exporter, distributor, scavenger, fetcher):
+        # TODO __repr__ self description of args
         self.exporter, self.distributor, self.scavenger, self.fetcher = \
             exporter, distributor, scavenger, fetcher
         self.item = None
@@ -213,13 +235,13 @@ class CommentWorker(BaseWorker):
     def __init__(self, *, distributor, scavenger, exporter, history, loop, time_range):
         super().__init__(distributor=distributor, scavenger=scavenger,
                          fetcher=CIDFetcher(loop=loop), exporter=exporter)
-        start, end = time_range
-        self.start = start if start is not None else 0
-        self.end = end if end is not None else CommentFlow.MAX_TIMESTAMP
         self.history = history
-        self._time_range = start is not None or end is not None
-        if self._time_range:
-            _logger.debug('time range is set')
+        self.start, self.end = time_range
+        if self.start is None or self.end is None:
+            self._has_time_range = False
+        else:
+            self._has_time_range = True
+            _logger.debug('time range is set: start: %s, end: %s', self.start, self.end)
 
     async def _next(self, cid):
         """Make a minimum number of requests to scrape all comments including history.
@@ -237,28 +259,38 @@ class CommentWorker(BaseWorker):
         latest = await self.fetcher.get_comments_root(cid)
 
         # Check if there are history comments
-        history = False
+        has_history = False
         limit = self._find_int(latest, 'maxlimit', 1)
+        segments = self._digest(latest)
         if self.history:
-            segments = self._digest(latest)
             normal = segments[0]
             if len(normal) >= limit:  # no less comments than a file could contain
                 first_date = normal[0].attrib['date']
                 ds = self._find_int(latest, 'ds', 0)  # ds may not be provided
                 start, end = max(self.start, ds), min(self.end, first_date)
                 if start <= end:  # not all comments are in time range
-                    history = True
+                    has_history = True
 
-        if history:
+        # Deal with history stuff
+        if has_history:
             pools = tuple([segment] for segment in segments)  # pool is a list of segments
             histories, roll_dates = await self._scrape_history(cid, pools, limit, start, end)
             flows = [self._join(reversed(pool)) for pool in pools]  # Join segments into flows
-            if self._time_range:  # If time range is set, the comments are not splitted
+        else:
+            histories = flows = roll_dates = None
+
+        # Trucate comments if time_range was set
+        if self._has_time_range:
+            if has_history:  # only trim flows
                 for flow in flows:
                     self._trim(flow, self.start, self.end)
                 roll_dates = None
-        else:
-            histories = flows = roll_dates = None
+            else:  # only trim latest
+                latest = find_elems(latest, CommentFlow.ROOT_HEADERS)
+                for segment in segments:
+                    self._trim(segment, self.start, self.end)
+                    latest.extend(segment)
+
         return CommentFlow(latest, histories, flows, roll_dates, limit)
 
     async def _scrape_history(self, cid, pools, limit, start, end):
@@ -382,8 +414,6 @@ class CommentWorker(BaseWorker):
     @staticmethod
     def _trim(flow, start, end):
         """Discard all comments whose dates are not in the range [start, end]"""
-        if start > end:
-            return
         length = len(flow)
         ifront, irear = length, 0
         for i, cmt in enumerate(flow):

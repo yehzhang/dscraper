@@ -4,8 +4,8 @@ import re
 from collections import defaultdict
 import zlib
 
-from .utils import (FrequencyController, AutoConnector, parse_comments_xml,
-                    parse_rolldate_json, escape_invalid_xml_chars)
+from .utils import (AutoConnector, parse_comments_xml, parse_rolldate_json,
+                    escape_invalid_xml_chars)
 from .exceptions import (HostError, ConnectTimeout, ReadTimeout, ResponseError, MultipleErrors,
                          NoResponseReadError, PageNotFound, DecodeError)
 from . import __version__
@@ -35,13 +35,10 @@ class BaseFetcher:
         'Connection': 'keep-alive'
     }
 
-    controllers = defaultdict(FrequencyController)
-
     def __init__(self, host, port=PORT, headers=None, *, loop):
         if not headers:
             headers = dict(self._DEFAULT_HEADERS)
         headers['Host'] = host
-        self._controller = self.controllers[host]
         self._session = Session(host, port, headers, loop=loop)
         # Export the methods
         self.open = self._session.connect
@@ -63,7 +60,6 @@ class BaseFetcher:
         :param string uri: the URI to fetch content from
         :raise: HostError, DecodeError, PageNotFound
         """
-        await self._controller.wait()
         # try to get the response
         try:
             return await self._session.get(uri)

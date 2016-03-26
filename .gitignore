@@ -12,3 +12,5 @@ Danmaku\ Crawler/log
 runner.py
 snippets/
 log/
+
+*.pyc

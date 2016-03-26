@@ -8,14 +8,25 @@ from itertools import chain, islice
 
 from .exporter import FileExporter, StreamExporter
 from .exceptions import Scavenger, NoMoreItems
-from .utils import Sluice, validate_id
+from .utils import Sluice, validate_id, CommentFlow
 from .company import CidCompany, AidCompany, CID, AID
 
 _logger = logging.getLogger(__name__)
 
 async def get(cid, history=True, *, loop=None):
     """Get the XML string of all comments."""
-    return await _get('', 1, history, loop)
+    if loop is None:
+        loop = asyncio.get_event_loop()
+    stream = io.StringIO()
+    exporter = StreamExporter(stream, '', loop=loop)
+    scraper = Scraper(exporter, history=history, max_workers=1, loop=loop)
+
+    scraper.add(cid)
+    await scraper.async_run()
+
+    text = stream.getvalue()
+    stream.close()
+    return text
 
 async def get_list(targets, history=True, *, loop=None):
     """Get a list of XML strings of the targets."""
@@ -26,24 +37,21 @@ async def get_list(targets, history=True, *, loop=None):
         num_workers = min(len(targets), 6)
     except TypeError:
         num_workers = 6
-    ltext = await _get(end, num_workers, history, loop).split(end)
-    ltext.pop()
-
-    # TODO split result not sorted
-    return ltext
-
-async def _get(end, num_workers, history, loop):
     if loop is None:
         loop = asyncio.get_event_loop()
     stream = io.StringIO()
-    exporter = StreamExporter(stream, end)
-    scraper = Scraper(history=history, max_workers=num_workers, loop=loop)
+    exporter = StreamExporter(stream, end, loop=loop)
+    scraper = Scraper(exporter, history=history, max_workers=num_workers, loop=loop)
 
+    scraper.add_list(targets)
     await scraper.async_run()
 
-    text = stream.getvalue()
+    ltext = stream.getvalue().split(end)
+    ltext.pop()
     stream.close()
-    return text
+
+    # TODO split result not sorted
+    return ltext
 
 
 class Scraper:
@@ -51,21 +59,38 @@ class Scraper:
 
     :param exporter exporter: handler of data fetched
     :param bool history: whether scrape history comments or not
-    :param (int, int) time_range: two unix timestamps specifying the beginning and ending
-        dates between which comments should be scraped (inclusive)
+    :param (int/None, int/None) time_range: two unix timestamps specifying the starting and
+        ending dates between which comments should be scraped (inclusive)
     :param int max_workers: maximum number of workers (connections) to one host the scraper
         could establish at the same time
 
     TODO add user interface during running using the curses library
-    TODO max_workers = 3? how to control maximum workers across companies? <- class variable
     """
     MAX_WORKERS = 24
     _IND = 'individual'
 
-    def __init__(self, exporter=None, history=True, time_range=(None, None), max_workers=6, *,
+    def __init__(self, exporter=None, history=True, time_range=None, max_workers=6, *,
                  loop=None):
         if not 0 < max_workers <= self.MAX_WORKERS:
             raise ValueError('number of workers is not in range [1, {}]'.format(self.MAX_WORKERS))
+        if time_range is None:
+            time_range = (None, None)
+        else:
+            start, end = time_range
+            if start is None:
+                start = 0
+            if end is None:
+                end = CommentFlow.MAX_TIMESTAMP
+            try:
+                start, end = map(int, (start, end))
+            except TypeError:
+                raise TypeError(
+                    'Expected (\'int/None\', \'int/None\') as time range, not (\'{}\', \'{}\')'.format(
+                        *map(type, time_range))) from None
+            if start > end:
+                raise ValueError('{} is not a valid time range'.format(time_range))
+            time_range = (start, end)
+
         self.loop = loop or asyncio.get_event_loop()
         self.exporter = exporter or FileExporter(loop=self.loop)
         self.history, self.time_range = history, time_range
@@ -86,7 +111,7 @@ class Scraper:
         :param int end:
         """
         if start <= 0 or end < start:
-            raise ValueError('not a valid range: [{} - {}]'.format(start, end))
+            raise ValueError('not a valid range: {} - {}'.format(start, end))
         self._iters[company_type].append(range(start, end + 1))
         return self
 
@@ -146,13 +171,20 @@ class Scraper:
             distributor = BlockingDistributor(loop=self.loop)
         company = CidCompany(distributor, history=self.history, scavenger=scavenger,
                              exporter=exporter, time_range=self.time_range, loop=self.loop)
+
+        # TODO max_workers = min(max_workers, len(disteibutor))
         company.hire(self.max_workers)
+
         targets = self._iters[CID]
         targets.append(self._iters[(CID, self._IND)])
         company.post_list(targets)
         company.set()
+        if company.get_total() == 0:
+            _logger.info('No targets assigned')
+            return []
+
         companies.append(company)
-        del self.history, self.time_range, scavenger, distributor, exporter, company, targets
+        del scavenger, distributor, exporter, company, targets
         self._iters.clear()
 
         await self.exporter.connect()
@@ -233,10 +265,11 @@ class BlockingDistributor:
     def dump(self, num=None):
         """Remove all items yet to be distributed, and return at most num of them."""
         iter_items = chain(self._iter or [], *self._queue)
-        self.clear()
         if num is not None:
             iter_items = islice(iter_items, num)
-        return iter_items
+        items = list(iter_items)
+        self.clear()
+        return items
 
     def clear(self):
         """Remove all items yet to be distributed."""

@@ -15,7 +15,7 @@ __license__ = 'Apache 2.0'
 __copyright__ = 'Copyright 2016 Simon Zhang'
 
 import sys
-assert sys.version_info >= (3, 5)
+assert sys.version_info >= (3, 5), 'Minimum version 3.5'
 
 from .exceptions import HostError, DecodeError, PageNotFound
 from .scraper import Scraper, get
