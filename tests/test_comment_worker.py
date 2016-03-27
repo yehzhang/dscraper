@@ -264,6 +264,7 @@ STUB_DATA_TRIM = [
     }
 ]
 
+
 class TestCommentWorker(Test):
 
     def setUp(self):
@@ -304,7 +305,8 @@ class TestCommentWorker(Test):
                     new_elem = Element('')
                     new_elem.attrib['id'] = elem
                     segment[i] = new_elem
-            self.assertEqual(self.get_id_list(self.worker._join(segments)), data[TARG], 'incorrect joining')
+            self.assertEqual(self.get_id_list(self.worker._join(segments)),
+                             data[TARG], 'incorrect joining')
 
     def test_trim(self):
         for data in STUB_DATA_TRIM:
@@ -315,6 +317,7 @@ class TestCommentWorker(Test):
     @staticmethod
     def get_id_list(elems):
         return [elem.attrib['id'] for elem in elems]
+
 
 class DummyFetcher(ActionRecorder):
 

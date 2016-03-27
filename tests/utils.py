@@ -16,10 +16,13 @@ class Test(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        cls.loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(cls.loop)
+        loop = cls.loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        cls.loop_until_complete = loop.run_until_complete
 
     @classmethod
     def tearDownClass(cls):
         cls.loop.close()
 
+    def gather(self, *coros):
+        return self.loop.run_until_complete(asyncio.gather(*coros))
