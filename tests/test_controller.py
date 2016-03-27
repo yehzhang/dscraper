@@ -10,11 +10,12 @@ logger = logging.getLogger(__name__)
 
 from .utils import Test
 
+EPS = 1e-6
 
 class TestController(Test):
 
     INVERTAL = 0.2
-    CONFIG_NONE = (0, 0, 0, 1e-9, None)
+    CONFIG_NONE = (0, 0, 0, EPS, None)
     CONFIG_ALL_DAY_NONE = (0, 0, 0, 0, None)
     CONFIG_INVALID = (0, INVERTAL, -0.1, 22, None)
     CONFIG_INVALID2 = (0, INVERTAL, 0, 24.1, None)
@@ -38,9 +39,9 @@ class TestController(Test):
     def test_now_wait(self):
         now = datetime.datetime.now()
         start = end = now.hour + now.minute / 60 + now.second / 3600
-        current = FrequencyController((0, self.INVERTAL, start - 0.1, end + 0.1, None))
-        pos_offset = FrequencyController((0, self.INVERTAL, start - 0.1, end - 0.01, None))
-        neg_offset = FrequencyController((0, self.INVERTAL, start + 0.01, end + 0.1, None))
+        current = FrequencyController((0, self.INVERTAL, start - EPS, end + EPS, None))
+        pos_offset = FrequencyController((0, self.INVERTAL, start - EPS, end - EPS, None))
+        neg_offset = FrequencyController((0, self.INVERTAL, start + EPS, end + EPS, None))
         for cont in (current, pos_offset, neg_offset):
             self.assertFalse(self.wait_once(cont), 'First wait blocked')
 

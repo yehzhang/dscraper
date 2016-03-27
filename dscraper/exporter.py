@@ -3,6 +3,7 @@ import os
 import sys
 from concurrent.futures import ThreadPoolExecutor
 from xml.sax.saxutils import escape
+import functools
 
 from .utils import AutoConnector
 
@@ -48,7 +49,7 @@ class StreamExporter(BaseExporter):
     async def dump(self, cid, flow, *, aid=None):
         # TODO if aid, Comments from AID and CID
         self.write(self.stream, flow.get_document() if flow.has_history() else flow.get_latest())
-        stream.write(self.end)
+        self.stream.write(self.end)
 
     @staticmethod
     def write(stream, elements):
@@ -66,24 +67,25 @@ class FileExporter(BaseExporter):
     """Save comments as XML files.
 
     :param str path: path to put files. Default as './comments'.
-    :param bool merge: whether save all comments in one file along with history,
+    :param bool join: whether save all comments in one file along with history,
         or keep them separate as the original form. Notice: if choose not to
-        merge files, the resulting files could take huge space because of
+        join files, the resulting files could take huge space because of
         duplication.
     """
     _OUT_DIR = 'comments'
 
-    def __init__(self, path=None, merge=False, *, loop=None):
+    def __init__(self, path=None, join=False, *, loop=None):
         super().__init__('Failed to save as files', loop=loop)
         if path is None:
             path = self._OUT_DIR
         self._home = os.path.abspath(path)
-        self._split = not merge
+        self._split = not join
         self._executor = None
 
     async def dump(self, *args, **kwargs):
         try:
-            await self.loop.run_in_executor(self._executor, self._dump, *args, **kwargs)
+            # Data will be written even if cancelled by this far
+            await self.loop.run_in_executor(self._executor, functools.partial(self._dump, *args, **kwargs))
         except AttributeError:
             raise RuntimeError('FileExporter is not connected yet') from None
 
@@ -101,7 +103,6 @@ class FileExporter(BaseExporter):
             latest = flow.get_document()
         self._write(latest, wd, '{cid}.xml'.format(cid=cid))
 
-
     async def _open_connection(self):
         wd = self._cd()
         os.makedirs(wd, exist_ok=True)
@@ -115,9 +116,11 @@ class FileExporter(BaseExporter):
         return os.path.join(self._home, str(path))
 
     def _write(self, elements, wd, filename):
+        _logger.debug('Writing to %s', filename)
         os.makedirs(wd, exist_ok=True)
         with open(os.path.join(wd, filename), 'w') as fout:
             StreamExporter.write(fout, elements)
+        _logger.debug('Writing to %s completed', filename)
 
 
 class MysqlExporter(BaseExporter):

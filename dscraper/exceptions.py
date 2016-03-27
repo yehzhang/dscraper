@@ -1,4 +1,5 @@
 import logging
+import concurrent
 
 _logger = logging.getLogger(__name__)
 
@@ -36,8 +37,10 @@ class ConnectTimeout(HostError):
     """All attempts to connect to the host timed out."""
     level = logging.WARNING
 
+
 class ReadTimeout(HostError):
     """Attempt to read from the host timed out."""
+
 
 class ResponseError(HostError):
     """The response from the host was invalid."""
@@ -100,7 +103,7 @@ class Scavenger:
     """Handles and logs all exceptions."""
     _MAX_HEALTH = 120
     _REGEN = 12
-    _UNEXPECTED_DAMAGE = 100
+    _UNEXPECTED_DAMAGE = 119.9
 
     def __init__(self):
         self.dead = False
@@ -110,7 +113,6 @@ class Scavenger:
         self._failures = []
 
     def set_recorders(self, num):
-        _logger.debug('set %d recorders', num)
         if num < 0:
             raise ValueError('cannot set \'{}\' recorders'.format(num))
         self._health = self._health / self._recorders * num
@@ -123,26 +125,32 @@ class Scavenger:
 
     def failure(self, worker, e=None):
         # TODO log worker type, change cid to aid or sth in logging
+        # Logging exception and calculate consequence
         cid = str(worker.item) if worker.item else '\'not started yet\''
-        if e is None:
-            _logger.exception('Unexpected exception occured during scraping cid %s', cid)
-            self._health -= self._UNEXPECTED_DAMAGE
-        else:
+        if isinstance(e, DscraperError):  # Expected error
             message = '{} at CID {}'.format(self.capitalize(e.args[0]), cid)
             if e.__cause__:
                 message += ': ' + e.__cause__
             _logger.log(e.level, message)
             self._health -= e.damage
-        if self._health <= 0:
-            if not self.dead:
-                _logger.critical('Too many exceptions triggered. The scraper is about to stop')
+        elif isinstance(e, concurrent.futures._base.CancelledError):  # worker cancelled
+            _logger.info('A worker was forced to stop')
+        else:  # Unexpected error
+            _logger.exception('Unexpected exception occured during scraping cid %s', cid)
+            self._health -= self._UNEXPECTED_DAMAGE
+
+        # Update status
+        if self._health <= 0 and not self.dead:
+            _logger.critical('Too many exceptions triggered. The scraper is about to stop')
             self.dead = True
+
+        # Update stats
         if isinstance(e, PageNotFound):
             self._cnt_success += 1
         else:
-            self._failures.append(cid)
-        _logger.debug('health: %d / %d, recorders: %d', self._health,
-                      self._max_health, self._recorders)
+            if worker.item is not None:
+                self._failures.append(worker.item)
+        _logger.debug('health: %d / %d', self._health, self._max_health)
 
     def is_dead(self):
         return self.dead

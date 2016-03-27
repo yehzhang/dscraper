@@ -29,28 +29,28 @@ def parse_args():
     # TODO mode: add AID; export: add mysql
     parser = argparse.ArgumentParser()
     parser.add_argument('-e', '--export', metavar='method', default='file',
-                        choices=[FILE, STDOUT], help='how is data exported')
+                        choices=[FILE, STDOUT], help='how data is exported')
     parser.add_argument('-p', '--path', metavar='path', default='./comments',
-                        help='where should files go if -e "file" was specified')
-    parser.add_argument('-m', '--merge', action='store_true', default=False,
-                        help='whether merging comments on different dates as one file if -e "file" was specified')
+                        help='where should files go, if -e "file" was specified')
+    parser.add_argument('-j', '--join', action='store_true', default=False,
+                        help='join comments of different dates into one file, if -e "file" was specified')
 
-    parser.add_argument('--no-history', dest='history', action='store_false', default=True,
-                        help='do not scrape history comments. Scrape latest comments only')
-    parser.add_argument('-t', '--type', metavar='type', default='cid',
-                        choices=['cid'], help='what kind of ID numbers are specified in -r and targets')
-    parser.add_argument('-s', '--start-time', metavar='start', dest='start', type=int, default=None,
-                        help='unix timestamp specifying the starting time of comments to scrape (inclusive)')
-    parser.add_argument('-n', '--end-time', metavar='end', dest='end', type=int, default=None,
-                        help='unix timestamp specifying the ending time of comments to scrape (inclusive)')
+    parser.add_argument('-b', '--no-history', dest='history', action='store_false', default=True,
+                        help='do not request history comments. Get latest comments only')
+    parser.add_argument('-t', '--type', metavar='id_type', default='cid',
+                        choices=['cid'], help='what kind of ID numbers in -r and targets are specified')
+    parser.add_argument('-s', '--start-time', metavar='timestamp', dest='start', type=int, default=None,
+                        help='unix timestamp of the earliest possible comments (inclusive)')
+    parser.add_argument('-n', '--end-time', metavar='timestamp', dest='end', type=int, default=None,
+                        help='unix timestamp of the latest possible comments (inclusive)')
 
-    parser.add_argument('-r', '--range', metavar=('first', 'last'), nargs=2, type=int, action='append', default=[],
+    parser.add_argument('-r', '--range', metavar=('id', 'id'), nargs=2, type=int, action='append', default=[],
                         help='the first and last ID numbers of consecutive targets to scrape. Can be specified multiple times')
     parser.add_argument('targets', nargs='*', type=int,
                         help='ID numbers of individual targets to scrape')
 
     parser.add_argument('-v', '--verbose', default=False, action='store_true',
-                        help='logging in a really verbose way')
+                        help='logging in a verbose way')
 
     args = parser.parse_args()
     if not (args.range or args.targets):
@@ -81,9 +81,9 @@ def config_logging(verbose):
 
 def main():
     args = parse_args()
-    export, path, start, end, mode, range_targets, targets, merge, history, verbose = \
+    export, path, start, end, mode, range_targets, targets, join, history, verbose = \
         args.export, args.path, args.start, args.end, args.type, args.range, args.targets, \
-        args.merge, args.history, args.verbose
+        args.join, args.history, args.verbose
     time_range = None if start is None and end is None else (start, end)
 
     config_logging(verbose)
@@ -91,7 +91,7 @@ def main():
     loop = asyncio.get_event_loop()
 
     if export == FILE:
-        exporter = dscraper.FileExporter(path, merge, loop=loop)
+        exporter = dscraper.FileExporter(path, join, loop=loop)
     elif export == STDOUT:
         exporter = dscraper.StreamExporter(loop=loop)
     elif export == MYSQL:
@@ -105,8 +105,8 @@ def main():
     for start, end in range_targets:
         scraper.add_range(start, end, mode)
 
-    logger.info('Start scraping with the configuration: export: %s, path: %s, time_range: %s, mode: %s, range_targets: %s, targets: %s, merge: %s, history: %s',
-                export, path, time_range, mode, range_targets, targets, merge, history)
+    logger.info('Start scraping with the configuration: export: %s, path: %s, time_range: %s, mode: %s, range_targets: %s, targets: %s, join: %s, history: %s',
+                export, path, time_range, mode, range_targets, targets, join, history)
     scraper.run()
 
     loop.close()

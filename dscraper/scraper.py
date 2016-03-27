@@ -5,6 +5,7 @@ import time
 import io
 from collections import deque, defaultdict
 from itertools import chain, islice
+import concurrent
 
 from .exporter import FileExporter, StreamExporter
 from .exceptions import Scavenger, NoMoreItems
@@ -96,6 +97,7 @@ class Scraper:
         self.history, self.time_range = history, time_range
         self.max_workers = max_workers
         self._iters = defaultdict(list)
+        self.companies = []
 
     def add(self, target, company_type=CID):
         """
@@ -131,7 +133,13 @@ class Scraper:
 
     def run(self):
         """Run the scraper."""
-        self.loop.run_until_complete(self.async_run())
+        fut = asyncio.ensure_future(self.async_run())
+        try:
+            self.loop.run_until_complete(fut)
+        except KeyboardInterrupt:
+            for company in self.companies:
+                company.close()
+            self.loop.run_until_complete(fut)
 
     async def async_run(self):
         """The indeed main coroutine that can be awaited."""
@@ -152,7 +160,7 @@ class Scraper:
         scavenger = Scavenger()
         distributor = None
         exporter = self.exporter
-        companies = []
+        self.companies.clear()
 
         # TODO Build the AidCompany
         # aid_targets = self._iters[AID]
@@ -161,7 +169,7 @@ class Scraper:
         #     distributor.set()
         #     company = AidCompany() # TODO
         #     distributor = company
-        #     companies.append(company)
+        #     self.companies.append(company)
         #     for target in self._iters[AID]:
         #         company.post(target)
 
@@ -169,11 +177,10 @@ class Scraper:
         if distributor is None:
             # If there is no AidCompany upstream, the CidCompany needs an initial distributor
             distributor = BlockingDistributor(loop=self.loop)
-        company = CidCompany(distributor, history=self.history, scavenger=scavenger,
-                             exporter=exporter, time_range=self.time_range, loop=self.loop)
-
         # TODO max_workers = min(max_workers, len(disteibutor))
-        company.hire(self.max_workers)
+        company = CidCompany(self.max_workers, distributor, history=self.history,
+                             scavenger=scavenger, exporter=exporter, time_range=self.time_range,
+                             loop=self.loop)
 
         targets = self._iters[CID]
         targets.append(self._iters[(CID, self._IND)])
@@ -183,14 +190,14 @@ class Scraper:
             _logger.info('No targets assigned')
             return []
 
-        companies.append(company)
+        self.companies.append(company)
         del scavenger, distributor, exporter, company, targets
         self._iters.clear()
 
         await self.exporter.connect()
         asyncio.ensure_future(self._patrol())
         try:
-            return await asyncio.gather(*[com.run() for com in companies])
+            return await asyncio.gather(*[com.run() for com in self.companies])
         finally:
             await self.exporter.disconnect()
 
@@ -213,13 +220,11 @@ class BlockingDistributor:
         self.is_set = self._latch.is_set
         self._count = 0
 
-    def post(self, it):
+    def post(self, it, recycle=False):
         """
         :param iterable it: can be a list or generator
         """
-        if self.is_set():
-            raise RuntimeError('distributor does not accept items anymore')
-        if self._count is not None:
+        if self._count is not None and not recycle:
             try:
                 self._count += len(it)
             except TypeError:
@@ -227,13 +232,11 @@ class BlockingDistributor:
         self._queue.append(iter(it))
         self._latch.leak()
 
-    def post_list(self, its):
+    def post_list(self, its, recycle=False):
         """
         :param list its: a list of lists or generators
         """
-        if self.is_set():
-            raise RuntimeError('distributor does not accept items anymore')
-        if self._count is not None:
+        if self._count is not None and not recycle:
             try:
                 self._count += sum(map(len, its))
             except TypeError:

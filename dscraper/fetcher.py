@@ -161,6 +161,7 @@ class Session(AutoConnector):
             try:
                 headers, body = await self._get(request)
             except HostError as e:
+                _logger.debug('Failed to request from the host %d time(s) for %s', retries + 1, e)
                 errors.append(e)
                 if retries >= self._READ_RETRIES:
                     if len(set(map(type, errors))) == 1:
@@ -200,7 +201,7 @@ class Session(AutoConnector):
         return headers, body
 
     async def _read(self):
-        # TODO Still get frozen upon reading a 404 page
+        # TODO Still get frozen occasionally upon reading a 404 page. Save response to debug
         response = b''
         content_length = is_chunked = None
 
@@ -274,6 +275,7 @@ class Session(AutoConnector):
             _logger.debug('Trying to reconnect to the host')
         self._reader, self._writer = await asyncio.open_connection(self.host, self.port,
                                                                    loop=self.loop)
+        _logger.debug('Connection established')
 
     async def disconnect(self):
         self._writer.close()

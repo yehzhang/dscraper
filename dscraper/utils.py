@@ -272,7 +272,7 @@ class AutoConnector:
 class CountLatch:
     """A CountLatch implementation.
 
-    A semaphore manages an internal counter which is incremented by each count() call
+    A CountLatch manages an internal counter which is incremented by each count() call
     and decremented by each count_down() call. When wait() finds that the counter is
     greater than zero, it blocks, waiting until some other thread calls count_down().
 
@@ -288,7 +288,7 @@ class CountLatch:
         self._loop = loop if loop else asyncio.get_event_loop()
 
     def locked(self):
-        """Returns True if semaphore can not be acquired immediately."""
+        """Returns True if CountLatch can not be acquired immediately."""
         return self._value > 0
 
     def count(self, num=1):
@@ -391,14 +391,14 @@ TIME_CONFIG_US = (0, 1, 18, 22.5, timezone('America/Los_Angeles'))
 
 
 class FrequencyController:
-    """
-    Limits the frequency of coroutines running across.
+    """Limits the frequency of coroutines running across in a certain period of time.
+    Frequency means in average, not fixed interval.
 
     :param tuple time_config: a 5-tuple of the configuration of the controller's behavior
         float interval: duration of waiting in common hours
-        float busy_interval: duration of waiting in rush hours
-        float start: beginning of the rush hour
-        float end: end of the rush hour
+        float busy_interval: duration of waiting at rush hour
+        float start: beginning of rush hour (inclusive)
+        float end: ending of rush hour (exclusive)
         tzinfo timezone: time zone where the host is
     """
     # TODO choose time config from the host's geolocation
@@ -412,18 +412,28 @@ class FrequencyController:
             self._is_rush_hour = lambda x: start <= x < end
         else:
             self._is_rush_hour = lambda x: 0 <= x < end or start <= x < 24
-        self._latch = asyncio.Semaphore(loop=loop)
+        self._sem = asyncio.Semaphore(loop=loop)
+        self.release = self._sem.release
         self._blocking = True
 
     async def wait(self):
-        """Controls frequency."""
+        """Controls frequency.
+
+        :return bool: True on blocked, False otherwise
+        """
+        blocked = False
         if self._blocking:
             interval = self.busy_interval if self.is_busy() else self.interval
             if interval > 0:
-                await self._latch.acquire()
-                self.loop.call_later(interval, self._latch.release)
-                return True
-        return False
+                blocked = self._sem.locked()
+                await self._sem.acquire()
+                if self._blocking:
+                    if self._sem.locked():
+                        self.loop.call_later(interval, self._sem.release)
+                else:
+                    self._sem.release()
+                    blocked = False
+        return blocked
 
     def is_busy(self):
         now = datetime.now(tz=self.tz)
@@ -431,16 +441,9 @@ class FrequencyController:
         return self._is_rush_hour(hour)
 
     def free(self):
-        """Stop blocking coroutines."""
-        if self._blocking:
-            self._latch.release()
-            self._blocking = False
-
-    def shut(self):
-        """Start blocking coroutines."""
-        if not self._blocking:
-            self.loop.run_until_complete(self._latch.acquire())
-            self._blocking = True
+        """Do not block coroutines any more."""
+        self._sem.release()
+        self._blocking = False
 
 
 class NullController:
