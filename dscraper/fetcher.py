@@ -5,7 +5,7 @@ from collections import defaultdict
 import zlib
 
 from .utils import (AutoConnector, parse_comments_xml, parse_rolldate_json,
-                    escape_invalid_xml_chars)
+                    escape_invalid_xml_chars, aretry)
 from .exceptions import (HostError, ConnectTimeout, ReadTimeout, ResponseError, MultipleErrors,
                          NoResponseReadError, PageNotFound, DecodeError)
 from . import __version__
@@ -77,7 +77,8 @@ class CIDFetcher(BaseFetcher):
     def __init__(self, *, loop):
         super().__init__(HOST_CID, loop=loop)
 
-    async def get_comments(self, cid, date=0):
+    @aretry
+    async def get_comments_root(self, cid, date=0):
         if date == 0:
             uri = self.CURRENT_URI.format(cid=cid)
         else:
@@ -85,17 +86,14 @@ class CIDFetcher(BaseFetcher):
 
         text = await self.get(uri)
         # Escape invalid XML chracters with their hexadecimal notations
-        return escape_invalid_xml_chars(text)
+        text = escape_invalid_xml_chars(text)
+        return parse_comments_xml(text)
 
-    async def get_rolldate(self, cid):
-        uri = self.ROLLDATE_URI.format(cid=cid)
-        return await self.get(uri)
-
-    async def get_comments_root(self, cid, date=0):
-        return parse_comments_xml(await self.get_comments(cid, date))
-
+    @aretry
     async def get_rolldate_json(self, cid):
-        return parse_rolldate_json(await self.get_rolldate(cid))
+        uri = self.ROLLDATE_URI.format(cid=cid)
+        text = await self.get(uri)
+        return parse_rolldate_json(text)
 
 
 class MetaCIDFetcher(BaseFetcher):

@@ -22,7 +22,8 @@ class BaseCompany:
     """
 
     def __init__(self, max_workers, worker_ctor, scavenger, *, loop):
-        self.max_workers = max_workers
+        self._intended_workers = max_workers
+        self.max_workers = 0
         self.loop = loop
         self.scavenger = scavenger
         self._closed = False
@@ -31,7 +32,7 @@ class BaseCompany:
         self._latch = CountLatch(loop=self.loop)
 
     async def run(self):
-        self._hire(self.max_workers)
+        self._hire(self._intended_workers)
         await self._latch.wait()
         return self.stat()
 
@@ -41,6 +42,7 @@ class BaseCompany:
             fut = self._workers[worker] = asyncio.ensure_future(worker.run(), loop=self.loop)
             _logger.debug('A worker is hired %s', worker)
             fut.add_done_callback(lambda x: self._on_fired(x.result()))
+        self.max_workers += num
         self._latch.count(num)
         self.scavenger.set_recorders(len(self._workers))
 
@@ -65,6 +67,7 @@ class BaseCompany:
         """The actual method to stop a worker."""
         _logger.debug('A worker is done %s', worker)
         self._workers.pop(worker)
+        self.max_workers -= 1
         self._latch.count_down()
         self.scavenger.set_recorders(len(self._workers))
 
@@ -108,7 +111,7 @@ class CidCompany(BaseCompany):
         await self._controller.wait()
 
         # Claim an item
-        # TODO Is the item lose on cancelled?
+        # TODO Is the item lost on cancelled?
         cid = await self.distributor.claim()
         try:
             validate_id(cid)
@@ -285,8 +288,8 @@ class CommentWorker(BaseWorker):
         limit = self._find_int(latest, 'maxlimit', 1)
         segments = self._digest(latest)
         if self.history:
-            normal = segments[0]
-            if len(normal) >= limit:  # no less comments than a file could contain
+            if self._len_cmt_pool_1(segments) >= limit:  # no less comments than a file could contain
+                normal = segments[0]
                 first_date = normal[0].attrib['date']
                 ds = self._find_int(latest, 'ds', 0)  # ds may not be provided
                 print(self.start, ds, self.end, first_date)
@@ -340,9 +343,9 @@ class CommentWorker(BaseWorker):
                 pool.append(segment)
             histories[date] = root
 
-            normal = segments[0]
-            if len(normal) < limit:
+            if self._len_cmt_pool_1(segments) < limit:
                 break
+            normal = segments[0]
             end = normal[0].attrib['date']  # assert len(normal) > 0 and date < end
             if start > end:
                 break
@@ -449,3 +452,10 @@ class CommentWorker(BaseWorker):
                 break
         if not (ifront == 0 and irear == length):
             flow[:] = flow[ifront:irear]
+
+    @staticmethod
+    def _len_cmt_pool_1(segments):
+        """Return the number of normal or protected comments, which are in the first comment pool
+        :param (normal_comments, protected_comments, _, _) pools:
+        """
+        return sum(map(len, segments[:2]))

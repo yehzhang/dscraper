@@ -9,7 +9,7 @@ import json
 import logging
 import itertools
 
-from .exceptions import ParseError, ContentError, ConnectTimeout
+from .exceptions import ParseError, ContentError, ConnectTimeout, DscraperError
 
 _logger = logging.getLogger(__name__)
 
@@ -64,6 +64,20 @@ def alock(coro):
     lock = asyncio.Lock()
     return _coro
 
+@decorator
+def aretry(coro):
+    async def _coro(*args, **kwargs):
+        t = 0
+        while True:
+            try:
+                return await coro(*args, **kwargs)
+            except DscraperError:
+                t += 1
+                if t >= ASYNC_RETRY:
+                    raise
+    return _coro
+
+ASYNC_RETRY = 3
 
 def validate_id(target):
     try:
@@ -101,6 +115,8 @@ def parse_comments_xml(text):
     try:
         root = et.fromstring(text)
     except et.ParseError:
+        # Mostly caused by mal-formatted data such as /5991091.xml, or illegal characters
+        _logger.debug('error xml text: %s', text)
         raise ParseError('failed to parse the XML data') from None
 
     # Check content
